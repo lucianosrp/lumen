@@ -1,0 +1,24 @@
+[package]
+name = "lumen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+dirs = "7.0.0"
+env_logger = "0.11.11"
+futures = "0.3.34"
+glam = "0.34.1"
+glyphon = "0.12"
+image = { version = "0.25", default-features = false, features = ["webp", "jpeg", "png"] }
+log = "0.4.34"
+pollster = "1.0.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thumbhash = "0.1.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "macros", "time", "fs"] }
+wgpu = "30"
+winit = "0.30"
