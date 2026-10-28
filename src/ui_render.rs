@@ -10,8 +10,6 @@ use glyphon::{
 
 use crate::ui::{Align, Font, Frame, ImageId};
 
-const ICON_FAMILY: &str = "JetBrainsMono Nerd Font";
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct QuadInstance {
@@ -234,7 +232,6 @@ impl UiRenderer {
             buf.set_size(key.max_width.map(f32::from_bits), None);
             let family = match key.font {
                 Font::Sans => Family::SansSerif,
-                Font::Icons => Family::Name(ICON_FAMILY),
             };
             let attrs = Attrs::new().family(family).weight(Weight(key.weight));
             buf.set_text(&key.text, &attrs, Shaping::Advanced, None);

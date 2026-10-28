@@ -1203,10 +1203,11 @@ impl MapView {
                 let ring = 1.5 * s;
                 let outer = [cx - w / 2.0 - ring, cy - h / 2.0 - ring, w + 2.0 * ring, h + 2.0 * ring];
                 push(layer, Quad::solid(outer, [1.0, 1.0, 1.0, a], outer[3] / 2.0), area);
-                push(layer, Quad::solid([cx - w / 2.0, cy - h / 2.0, w, h], ui::rgb(theme::accent(), a), h / 2.0), area);
+                let p = theme::palette();
+                push(layer, Quad::solid([cx - w / 2.0, cy - h / 2.0, w, h], ui::rgb(p.accent, a), h / 2.0), area);
                 let text = Text::new(label, cx, cy - size * 0.625, size)
                     .weight(700)
-                    .color([255, 255, 255, (255.0 * a) as u8])
+                    .color(theme::text_rgba(p.on_accent, a))
                     .align(ui::Align::Center)
                     .clip(area);
                 layer.text(text);
@@ -1225,7 +1226,7 @@ impl MapView {
             let alpha = 0.86 * (1.0 - t * t * (3.0 - 2.0 * t));
             let y0 = area[1] + (h * i as f32 / bands as f32).round();
             let y1 = area[1] + (h * (i + 1) as f32 / bands as f32).round();
-            self.layer.quad(Quad::solid([area[0], y0, area[2], y1 - y0], [0.0, 0.0, 0.0, alpha], 0.0));
+            self.layer.quad(Quad::solid([area[0], y0, area[2], y1 - y0], ui::rgb(theme::scrim(), alpha), 0.0));
         }
 
         // Place name under the hovered pin.
@@ -1237,10 +1238,11 @@ impl MapView {
             let (cx, y) = (r[0] + r[2] / 2.0, r[1] + r[3] + 8.0 * s);
             let a = pin.hover;
             push(&mut self.top, Quad::solid([cx - w / 2.0, y + 2.0 * s, w, h], [0.0, 0.0, 0.0, 0.3 * a], h / 2.0), area);
-            push(&mut self.top, Quad::solid([cx - w / 2.0, y, w, h], ui::rgb(theme::sidebar(), 0.94 * a), h / 2.0), area);
+            let p = theme::palette();
+            push(&mut self.top, Quad::solid([cx - w / 2.0, y, w, h], ui::rgb(p.raised, 0.96 * a), h / 2.0), area);
             let text = Text::new(pin.title.clone(), cx, y + (h - size * 1.25) / 2.0, size)
                 .weight(600)
-                .color([255, 255, 255, (235.0 * a) as u8])
+                .color(theme::text_rgba(p.fg, 0.95 * a))
                 .align(ui::Align::Center)
                 .clip(area);
             self.top.text(text);
@@ -1248,9 +1250,10 @@ impl MapView {
 
         if self.loaded && self.markers.is_empty() && self.status.is_empty() {
             let c = self.focus();
+            // Over the (always dark) map tiles.
             let text = Text::new("No photos with a location yet", c[0], c[1] - 10.0 * s, 17.0 * s)
                 .weight(600)
-                .color(theme::text_dim())
+                .color(theme::text_rgba(theme::hud().fg_dim, 0.9))
                 .align(ui::Align::Center);
             self.layer.text(text);
         }
@@ -1259,8 +1262,9 @@ impl MapView {
         let tw = renderer.ui.measure(ATTRIBUTION, size, 400, Font::Sans);
         let (w, h) = (tw + 12.0 * s, size * 1.25 + 6.0 * s);
         let (x, y) = (area[0] + area[2] - w - 6.0 * s, area[1] + area[3] - h - 6.0 * s);
-        self.layer.quad(Quad::solid([x, y, w, h], [0.0, 0.0, 0.0, 0.55], 5.0 * s));
-        self.layer.text(Text::new(ATTRIBUTION, x + 6.0 * s, y + 3.0 * s, size).color(theme::text_dim()));
+        let hud = theme::hud();
+        self.layer.quad(Quad::solid([x, y, w, h], ui::rgb(hud.glass, 0.7), 5.0 * s));
+        self.layer.text(Text::new(ATTRIBUTION, x + 6.0 * s, y + 3.0 * s, size).color(theme::text_rgba(hud.fg_dim, 0.85)));
         fading
     }
 }

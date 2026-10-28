@@ -22,7 +22,9 @@ use crate::grid::Spec;
 use crate::library::{Asset, Library};
 use crate::loader::{Collection, Patch, Source, group};
 use crate::render::{LEAVING_SHIFT, SELECTED_BIT};
+use crate::icons::IconStyle;
 use crate::ui::{Align, Font, Layer, Quad, Text, contains, rgb, theme};
+use crate::widgets::{self, ICON_WEIGHT, ROUND, ROUND_PITCH, TOOLBAR_Y, round_button};
 
 /// How long removed tiles take to dim away before the grid closes the gap.
 const LEAVE_TIME: f32 = 0.18;
@@ -30,10 +32,7 @@ const TOAST_TIME: Duration = Duration::from_secs(5);
 const TOAST_FADE: f32 = 0.2;
 const SELECTED: u8 = 1;
 const LEAVING: u8 = 2;
-/// The favorite heart, Apple's system pink-red.
-const HEART: [u8; 4] = [255, 69, 88, 255];
-const ERROR: [u8; 4] = [255, 120, 110, 255];
-const ACCENT_TEXT: [u8; 4] = [64, 156, 255, 255];
+const ICON: f32 = 16.0;
 
 /// What an asset looks like to the collections that matter here.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -119,14 +118,23 @@ enum Cmd {
 impl Cmd {
     fn icon(self) -> &'static str {
         match self {
-            Cmd::Open => "\u{f065}",
-            Cmd::Favorite(true) => "\u{f08a}",
-            Cmd::Favorite(false) => "\u{f004}",
-            Cmd::Archive(_) => "\u{f187}",
-            Cmd::Album => "\u{f0fe}",
-            Cmd::Trash => "\u{f1f8}",
-            Cmd::Restore => "\u{f0e2}",
-            Cmd::Clear => "\u{f00d}",
+            Cmd::Open => "maximize-2",
+            Cmd::Favorite(_) => "heart",
+            Cmd::Archive(true) => "archive",
+            Cmd::Archive(false) => "archive-restore",
+            Cmd::Album => "image-plus",
+            Cmd::Trash => "trash-2",
+            Cmd::Restore => "rotate-ccw",
+            Cmd::Clear => "x",
+        }
+    }
+
+    /// Icon, style and tint; `favorite` says whether the targets are already favorites
+    /// (a filled red heart, like Photos).
+    fn look(self, favorite: bool) -> (&'static str, IconStyle, Option<u32>) {
+        match self {
+            Cmd::Favorite(_) if favorite => ("heart", IconStyle::filled(), Some(theme::palette().red)),
+            c => (c.icon(), IconStyle::weight(ICON_WEIGHT), None),
         }
     }
 
@@ -1073,10 +1081,6 @@ pub fn draw(core: &mut Core, now: Instant) -> bool {
     busy
 }
 
-fn button_bg(hovered: bool, on: bool, a: f32) -> [f32; 4] {
-    if on { rgb(theme::accent(), 0.9 * a) } else { rgb(0xffffff, if hovered { 0.24 } else { 0.14 } * a) }
-}
-
 fn alpha(c: [u8; 4], a: f32) -> [u8; 4] {
     [c[0], c[1], c[2], (c[3] as f32 * a.clamp(0.0, 1.0)) as u8]
 }
@@ -1087,27 +1091,29 @@ fn draw_toolbar(core: &mut Core, out: &mut Layer) {
     let ca = core.viewer.chrome();
     let targets = viewer_target(core);
     let cmds = if targets.is_empty() { Vec::new() } else { commands(core, &targets) };
-    core.viewer.toolbar_width = cmds.len() as f32 * 44.0 * s;
+    let pitch = (ROUND_PITCH * s).round();
+    core.viewer.toolbar_width = cmds.len() as f32 * pitch;
     if ca < 0.003 || targets.is_empty() {
         return;
     }
     let favorite = core.actions.favorite(&targets[0]);
-    let cursor = core.actions.cursor;
-    let d = 34.0 * s;
-    let mut x = core.size.0 as f32 - 50.0 * s;
+    let (cursor, armed) = (core.actions.cursor, core.actions.armed);
+    let d = (ROUND * s).round();
+    // The info button's slot (drawn by the viewer), then leftwards at an even pitch.
+    let mut x = (core.size.0 as f32 - 16.0 * s - d).round();
     // Right to left: trash nearest the info button, the heart furthest, like Photos' bar.
     for cmd in cmds.into_iter().rev() {
-        x -= 44.0 * s;
-        let rect = [x, 16.0 * s, d, d];
+        x -= pitch;
+        let rect = [x, (TOOLBAR_Y * s).round(), d, d];
         let hovered = contains(rect, cursor.0, cursor.1);
-        let on = matches!(cmd, Cmd::Archive(false));
-        out.quad(Quad::solid(rect, button_bg(hovered, on, ca), d / 2.0));
-        let (icon, color) = match cmd {
-            Cmd::Favorite(_) if favorite => ("\u{f004}", HEART),
-            Cmd::Favorite(_) => ("\u{f08a}", theme::text()),
-            c => (c.icon(), theme::text()),
-        };
-        out.text(Text::new(icon, x + d / 2.0, rect[1] + d / 2.0 - 10.0 * s, 16.0 * s).icon().align(Align::Center).color(alpha(color, ca)));
+        let pressed = hovered && armed == Some(Hit::Toolbar(cmd));
+        // Inside Archive, the archive button shows as switched on (it unarchives).
+        let active = matches!(cmd, Cmd::Archive(false));
+        let (icon, style, tint) = if active { ("archive", IconStyle::weight(ICON_WEIGHT), None) } else { cmd.look(favorite) };
+        // Over the viewer's dark surround.
+        let tint = tint.map(|_| theme::hud().red);
+        let st = widgets::State { hovered, pressed, active };
+        round_button(out, rect[0], rect[1], s, icon, style, tint, st, ca);
         core.actions.hits.push((Hit::Toolbar(cmd), rect));
     }
 }
@@ -1118,7 +1124,7 @@ fn draw_bar(core: &mut Core, out: &mut Layer, x0: f32, gw: f32, bottom: f32) -> 
     let targets = core.actions.selection();
     let mut cmds = commands(core, &targets);
     cmds.push(Cmd::Clear);
-    let (bh, size, isize) = (44.0 * s, 13.0 * s, 14.0 * s);
+    let (bh, size, isize) = (44.0 * s, 13.0 * s, (ICON * s).round());
     let label = format!("{} selected", group(core.actions.selected));
     let ui = &mut core.renderer.ui;
     let lw = ui.measure(&label, size, 600, Font::Sans);
@@ -1133,25 +1139,28 @@ fn draw_bar(core: &mut Core, out: &mut Layer, x0: f32, gw: f32, bottom: f32) -> 
     let total = 18.0 * s + lw + 14.0 * s + widths.iter().sum::<f32>() + gap * widths.len() as f32 + 6.0 * s;
     let (bx, by) = (x0 + (gw - total) / 2.0, bottom - bh);
     let bar = [bx, by, total, bh];
-    out.quad(Quad::solid([bx - 1.0, by - 1.0, total + 2.0, bh + 2.0], rgb(0x3a3a3c, 0.9), bh / 2.0 + 1.0));
-    out.quad(Quad::solid(bar, rgb(0x1c1c1e, 0.97), bh / 2.0));
+    let p = theme::palette();
+    popover_bg(out, bar, bh / 2.0, 1.0, s);
     let cy = by + bh / 2.0;
     out.text(Text::new(label, bx + 18.0 * s, cy - size * 0.625, size).weight(600).color(theme::text()));
     let mut x = bx + 18.0 * s + lw + 14.0 * s;
     let cursor = core.actions.cursor;
     for (cmd, bw) in cmds.into_iter().zip(widths) {
         let rect = [x, by + 5.0 * s, bw, bh - 10.0 * s];
-        if contains(rect, cursor.0, cursor.1) {
-            out.quad(Quad::solid(rect, rgb(0x3a3a3c, 1.0), rect[3] / 2.0));
+        let hovered = contains(rect, cursor.0, cursor.1);
+        if hovered {
+            let down = core.actions.armed == Some(Hit::Bar(cmd));
+            out.quad(Quad::solid(rect, rgb(p.shade(p.raised, if down { 0.16 } else { 0.1 }), 1.0), rect[3] / 2.0));
         }
+        // "Unfavorite" shows the filled heart it removes.
+        let (icon, style, tint) = cmd.look(matches!(cmd, Cmd::Favorite(false)));
         match cmd {
             Cmd::Clear => {
-                out.text(Text::new(cmd.icon(), x + bw / 2.0, cy - isize * 0.625, isize).icon().align(Align::Center).color(theme::text_dim()));
+                out.icon_styled(icon, [(x + bw / 2.0).round(), cy.round()], isize, rgb(p.fg_dim, 1.0), style);
             }
             _ => {
-                let heart = matches!(cmd, Cmd::Favorite(false));
-                let color = if heart { HEART } else { theme::text() };
-                out.text(Text::new(cmd.icon(), x + 12.0 * s, cy - isize * 0.625, isize).icon().color(color));
+                let c = [(x + 12.0 * s + isize / 2.0).round(), cy.round()];
+                out.icon_styled(icon, c, isize, rgb(tint.unwrap_or(p.fg), 1.0), style);
                 out.text(Text::new(bar_label(cmd), x + 12.0 * s + isize + 7.0 * s, cy - size * 0.625, size).weight(500).color(theme::text()));
             }
         }
@@ -1183,20 +1192,21 @@ fn draw_toast(core: &mut Core, out: &mut Layer, cx: f32, bottom: f32, now: Insta
     let ui = &mut core.renderer.ui;
     let tw = ui.measure(&t.text, size, 500, Font::Sans).min(core.size.0 as f32 * 0.7);
     let uw = if t.undo.is_some() { ui.measure("Undo", size, 600, Font::Sans) + 26.0 * s } else { 0.0 };
-    let icon = if t.error { "\u{f071}" } else { "\u{f00c}" };
+    let p = theme::palette();
+    let icon = if t.error { "circle-alert" } else { "circle-check" };
     let total = 18.0 * s + 22.0 * s + tw + uw + 18.0 * s;
-    let (x, y) = (cx - total / 2.0, bottom - th + (1.0 - a) * 8.0 * s);
-    out.quad(Quad::solid([x - 1.0, y - 1.0, total + 2.0, th + 2.0], rgb(0x3a3a3c, 0.9 * a), th / 2.0 + 1.0));
-    out.quad(Quad::solid([x, y, total, th], rgb(0x2c2c2e, 0.97 * a), th / 2.0));
+    let (x, y) = ((cx - total / 2.0).round(), (bottom - th + (1.0 - a) * 8.0 * s).round());
+    popover_bg(out, [x, y, total, th], th / 2.0, a, s);
     let cy = y + th / 2.0;
-    let ic = if t.error { ERROR } else { [48, 209, 88, 255] };
-    out.text(Text::new(icon, x + 18.0 * s, cy - 13.0 * s * 0.625, 13.0 * s).icon().color(alpha(ic, a)));
-    let color = if t.error { ERROR } else { theme::text() };
+    let ic = if t.error { p.red } else { p.green };
+    let px = crate::widgets::even_with(th, ICON * s);
+    out.icon_styled(icon, [x + 18.0 * s + px / 2.0, cy], px, rgb(ic, a), IconStyle::weight(ICON_WEIGHT));
+    let color = if t.error { theme::text_rgba(p.red, 1.0) } else { theme::text() };
     out.text(Text::new(t.text.clone(), x + 40.0 * s, cy - size * 0.625, size).weight(500).max_width(tw + 1.0).color(alpha(color, a)));
     if t.undo.is_some() {
         let ux = x + 40.0 * s + tw + 10.0 * s;
-        out.quad(Quad::solid([ux, cy - 8.0 * s, 1.0, 16.0 * s], rgb(0xffffff, 0.2 * a), 0.0));
-        out.text(Text::new("Undo", ux + 14.0 * s, cy - size * 0.625, size).weight(600).color(alpha(ACCENT_TEXT, a)));
+        out.quad(Quad::solid([ux, cy - 8.0 * s, s.round().max(1.0), 16.0 * s], rgb(p.shade(p.raised, 0.2), a), 0.0));
+        out.text(Text::new("Undo", ux + 14.0 * s, cy - size * 0.625, size).weight(600).color(alpha(theme::text_rgba(p.accent, 1.0), a)));
         core.actions.hits.push((Hit::Undo, [ux, y, uw + 18.0 * s, th]));
     }
     core.actions.hits.push((Hit::Panel, [x, y, total, th]));
@@ -1221,15 +1231,15 @@ fn draw_menu(core: &mut Core, out: &mut Layer) {
     let x = if menu.at.0 + width > w - 8.0 * s { menu.at.0 - width } else { menu.at.0 };
     let y = if menu.at.1 + height > h - 8.0 * s { (menu.at.1 - height).max(8.0 * s) } else { menu.at.1 };
     let rect = [x, y, width, height];
-    out.quad(Quad::solid([x - 6.0 * s, y - 2.0 * s, width + 12.0 * s, height + 14.0 * s], rgb(0x000000, 0.25), 16.0 * s));
-    out.quad(Quad::solid([x - 1.0, y - 1.0, width + 2.0, height + 2.0], rgb(0x48484a, 0.95), 10.0 * s + 1.0));
-    out.quad(Quad::solid(rect, rgb(0x252527, 0.98), 10.0 * s));
+    let p = theme::palette();
+    out.quad(Quad::solid([x - 6.0 * s, y - 2.0 * s, width + 12.0 * s, height + 14.0 * s], rgb(0x000000, if p.dark { 0.25 } else { 0.1 }), 16.0 * s));
+    popover_bg(out, rect, 10.0 * s, 1.0, s);
     let cursor = core.actions.cursor;
     let mut cy = y + pad;
     let mut hits = Vec::new();
     for (i, item) in menu.items.iter().enumerate() {
         let Some(cmd) = item else {
-            out.quad(Quad::solid([x + 12.0 * s, cy + sep / 2.0, width - 24.0 * s, s.max(1.0)], rgb(0xffffff, 0.12), 0.0));
+            out.quad(Quad::solid([x + 12.0 * s, (cy + sep / 2.0).round(), width - 24.0 * s, s.round().max(1.0)], rgb(p.shade(p.raised, 0.12), 1.0), 0.0));
             cy += sep;
             continue;
         };
@@ -1238,20 +1248,27 @@ fn draw_menu(core: &mut Core, out: &mut Layer) {
         if hovered {
             out.quad(Quad::solid(r, rgb(theme::accent(), 1.0), 6.0 * s));
         }
-        let icon = match cmd {
-            Cmd::Favorite(_) if favorite => "\u{f004}",
-            Cmd::Favorite(_) => "\u{f08a}",
-            c => c.icon(),
-        };
+        let (icon, style, tint) = cmd.look(favorite);
         let mid = cy + row / 2.0;
-        let ic = if matches!(cmd, Cmd::Favorite(_)) && favorite && !hovered { HEART } else { theme::text() };
-        out.text(Text::new(icon, x + 22.0 * s, mid - 13.0 * s * 0.625, 13.0 * s).icon().align(Align::Center).color(ic));
-        out.text(Text::new(label(*cmd), x + 40.0 * s, mid - size * 0.625, size).weight(500).color([255, 255, 255, 240]));
+        let fg = if hovered { p.on_accent } else { p.fg };
+        let ic = if hovered { fg } else { tint.unwrap_or(fg) };
+        let px = crate::widgets::even_with(row, ICON * s);
+        out.icon_styled(icon, [(x + 22.0 * s).round(), (cy + row / 2.0).round()], px, rgb(ic, 1.0), style);
+        out.text(Text::new(label(*cmd), x + 40.0 * s, mid - size * 0.625, size).weight(500).color(theme::text_rgba(fg, 0.96)));
         hits.push((Hit::Item(i), r));
         cy += row;
     }
     hits.push((Hit::Panel, rect));
     core.actions.hits.extend(hits);
+}
+
+/// A popover's body: `raised` with a hairline edge a shade lighter (dark) or darker (light).
+fn popover_bg(out: &mut Layer, r: [f32; 4], radius: f32, a: f32, s: f32) {
+    let p = theme::palette();
+    let line = s.round().max(1.0);
+    let edge = if p.dark { p.shade(p.raised, 0.14) } else { theme::mix(p.raised, 0x000000, 0.14) };
+    out.quad(Quad::solid([r[0] - line, r[1] - line, r[2] + 2.0 * line, r[3] + 2.0 * line], rgb(edge, 0.9 * a), radius + line));
+    out.quad(Quad::solid(r, rgb(p.raised, 0.98 * a), radius));
 }
 
 /// Clips `r` to `clip`, also returning the matching texture coordinates.
@@ -1274,19 +1291,22 @@ fn draw_picker(core: &mut Core, out: &mut Layer) {
     let (sw, sh) = (440.0 * s, (560.0 * s).min(h - 80.0 * s));
     let (x, y) = ((w - sw) / 2.0, (h - sh) / 2.0);
     let sheet = [x, y, sw, sh];
-    out.quad(Quad::solid([0.0, 0.0, w, h], rgb(0x000000, 0.45), 0.0));
-    out.quad(Quad::solid([x - 1.0, y - 1.0, sw + 2.0, sh + 2.0], rgb(0x48484a, 0.9), 14.0 * s + 1.0));
-    out.quad(Quad::solid(sheet, rgb(0x1c1c1e, 1.0), 14.0 * s));
+    let pal = theme::palette();
+    let accent_text = theme::text_rgba(pal.accent, 1.0);
+    out.quad(Quad::solid([0.0, 0.0, w, h], rgb(0x000000, if pal.dark { 0.45 } else { 0.25 }), 0.0));
+    popover_bg(out, sheet, 14.0 * s, 1.0, s);
     out.text(Text::new("Add to Album", x + 20.0 * s, y + 16.0 * s, 17.0 * s).weight(700).color(theme::text()));
     out.text(Text::new(targets, x + 20.0 * s, y + 40.0 * s, 12.5 * s).weight(500).color(theme::text_dim()));
     let cancel = [x + sw - 84.0 * s, y + 12.0 * s, 70.0 * s, 30.0 * s];
-    out.text(Text::new("Cancel", cancel[0] + cancel[2] - 6.0 * s, y + 18.0 * s, 13.5 * s).weight(500).align(Align::Right).color(ACCENT_TEXT));
+    out.text(Text::new("Cancel", cancel[0] + cancel[2] - 6.0 * s, y + 18.0 * s, 13.5 * s).weight(500).align(Align::Right).color(accent_text));
 
     let field = [x + 16.0 * s, y + 66.0 * s, sw - 32.0 * s, 34.0 * s];
-    out.quad(Quad::solid(field, rgb(0x2c2c2e, 1.0), 8.0 * s));
+    out.quad(Quad::solid(field, rgb(pal.shade(pal.raised, 0.08), 1.0), 8.0 * s));
     let fs = 14.0 * s;
     let ty = field[1] + field[3] / 2.0 - fs * 0.625;
-    out.text(Text::new("\u{f002}", field[0] + 12.0 * s, ty + 1.0 * s, 12.0 * s).icon().color(theme::text_faint()));
+    let px = crate::widgets::even_with(field[3], 15.0 * s);
+    let c = [(field[0] + 12.0 * s + px / 2.0).round(), (field[1] + field[3] / 2.0).round()];
+    out.icon_styled("search", c, px, rgb(pal.muted, 0.9), IconStyle::weight(ICON_WEIGHT));
     let tx = field[0] + 34.0 * s;
     let tw = core.renderer.ui.measure(&text, fs, 400, Font::Sans);
     if text.is_empty() {
@@ -1317,23 +1337,26 @@ fn draw_picker(core: &mut Core, out: &mut Layer) {
         let row = [list[0], ry, list[2], rh];
         let Some((vis, _)) = clipped(row, list) else { continue };
         if sel == Some(r) {
-            out.quad(Quad::solid(vis, rgb(0x2f2f33, 1.0), 8.0 * s));
+            out.quad(Quad::solid(vis, rgb(pal.shade(pal.raised, 0.07), 1.0), 8.0 * s));
         }
         let thumb = [row[0] + 10.0 * s, ry + 6.0 * s, 38.0 * s, 38.0 * s];
         let mid = ry + rh / 2.0;
         let clip_text = |t: Text| t.clip(list);
         if r == 0 {
             if let Some((q, _)) = clipped(thumb, list) {
-                out.quad(Quad::solid(q, rgb(0x2c2c2e, 1.0), 7.0 * s));
+                out.quad(Quad::solid(q, rgb(pal.shade(pal.raised, 0.1), 1.0), 7.0 * s));
             }
-            out.text(clip_text(Text::new("\u{f067}", thumb[0] + thumb[2] / 2.0, mid - 9.0 * s, 15.0 * s).icon().align(Align::Center).color(ACCENT_TEXT)));
+            let px = crate::widgets::even_with(thumb[2].round(), 18.0 * s);
+            let c = [(thumb[0] + thumb[2] / 2.0).round(), (thumb[1] + thumb[3] / 2.0).round()];
+            out.icon_styled("plus", c, px, rgb(pal.accent, 1.0), IconStyle::weight(ICON_WEIGHT));
+            out.clip_last(list);
             let label = if text.trim().is_empty() { "New Album…".to_string() } else { format!("New Album “{}”", text.trim()) };
-            out.text(clip_text(Text::new(label, thumb[0] + 50.0 * s, mid - 14.0 * s * 0.625, 14.0 * s).weight(500).max_width(list[2] - 80.0 * s).color(ACCENT_TEXT)));
+            out.text(clip_text(Text::new(label, thumb[0] + 50.0 * s, mid - 14.0 * s * 0.625, 14.0 * s).weight(500).max_width(list[2] - 80.0 * s).color(accent_text)));
         } else {
             let (id, name, count) = &albums[r - 1];
             match (core.sidebar.image(&format!("album:{id}")), clipped(thumb, list)) {
                 (Some(img), Some((q, uv))) => out.quad(Quad::image(q, img, uv, 1.0, 7.0 * s)),
-                (None, Some((q, _))) => out.quad(Quad::solid(q, rgb(0x2c2c30, 1.0), 7.0 * s)),
+                (None, Some((q, _))) => out.quad(Quad::solid(q, rgb(pal.shade(pal.raised, 0.1), 1.0), 7.0 * s)),
                 _ => {}
             }
             let tx = thumb[0] + 50.0 * s;

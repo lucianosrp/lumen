@@ -19,6 +19,7 @@ use crate::render::{atlas_bytes, atlas_dims};
 use crate::settings::{self, GpuMemory, Quality, ThumbSize};
 use crate::storage::{self, Sizes, format_bytes};
 use crate::ui::{Align, Text, rgb, theme};
+use crate::icons::IconStyle;
 use crate::widgets::{ButtonKind, Card, Ctx, Input, colors};
 
 /// Logical pixels.
@@ -53,6 +54,58 @@ struct Me {
     name: String,
 }
 
+/// `GET /api/server/storage`: the disk holding the library.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Disk {
+    disk_size_raw: u64,
+    disk_use_raw: u64,
+    disk_available_raw: u64,
+    disk_usage_percentage: f64,
+}
+
+/// `GET /api/users/me`: what this user's assets take.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Quota {
+    quota_usage_in_bytes: Option<u64>,
+    quota_size_in_bytes: Option<u64>,
+}
+
+/// `GET /api/server/statistics` (admins only).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerStats {
+    photos: u64,
+    videos: u64,
+    usage: u64,
+    usage_photos: Option<u64>,
+    usage_videos: Option<u64>,
+    #[serde(default)]
+    usage_by_user: Vec<UserUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserUsage {
+    user_name: String,
+    photos: u64,
+    videos: u64,
+    usage: u64,
+}
+
+/// Whatever of the server's storage this key may read; each part is None when it may not
+/// (401/403/404) or the request failed.
+#[derive(Default)]
+struct ServerStorage {
+    disk: Option<Disk>,
+    quota: Option<Quota>,
+    stats: Option<ServerStats>,
+}
+
+/// Above this share of the server disk in use, the bar turns red with a note.
+const DISK_WARN: f64 = 90.0;
+
 struct ServerInfo {
     version: String,
     user: Option<String>,
@@ -70,6 +123,7 @@ enum Server {
 enum Bg {
     Sizes(Sizes),
     Server(Result<ServerInfo, String>),
+    Storage(ServerStorage),
     Cleared(&'static str, u64),
 }
 
@@ -102,6 +156,8 @@ pub struct Page {
     measuring: bool,
     measured_at: Instant,
     server: Server,
+    server_storage: Option<ServerStorage>,
+    storage_loading: bool,
     /// "Clear all caches" was clicked once at this time.
     confirm_all: Option<Instant>,
     /// Which clear is running in the background.
@@ -129,6 +185,8 @@ impl Page {
             measuring: false,
             measured_at: Instant::now(),
             server: Server::Loading,
+            server_storage: None,
+            storage_loading: false,
             confirm_all: None,
             clearing: None,
             flash: None,
@@ -141,7 +199,7 @@ impl Page {
 
     /// True once cache sizes and server details have arrived (for headless screenshots).
     pub fn is_idle(&self) -> bool {
-        !self.measuring && self.clearing.is_none() && !matches!(self.server, Server::Loading)
+        !self.measuring && self.clearing.is_none() && !matches!(self.server, Server::Loading) && !self.storage_loading
     }
 
     fn measure(&mut self) {
@@ -162,6 +220,7 @@ impl Page {
             return;
         };
         self.server = Server::Loading;
+        self.fetch_storage(loader);
         let (immich, tx, wake) = (immich.clone(), self.tx.clone(), self.wake.clone());
         loader.handle().spawn(async move {
             let start = Instant::now();
@@ -182,6 +241,29 @@ impl Page {
                 Err(e) => Err(format!("{e:#}")),
             };
             let _ = tx.send(Bg::Server(info));
+            wake();
+        });
+    }
+
+    /// Server disk, own usage and (for admins) library statistics, in the background.
+    fn fetch_storage(&mut self, loader: &Loader) {
+        let Source::Immich(immich) = loader.source() else { return };
+        self.storage_loading = true;
+        let (immich, tx, wake) = (immich.clone(), self.tx.clone(), self.wake.clone());
+        loader.handle().spawn(async move {
+            let (disk, quota, stats) = tokio::join!(
+                immich.get_json::<Disk>("/server/storage"),
+                immich.get_json::<Quota>("/users/me"),
+                immich.get_json::<ServerStats>("/server/statistics"),
+            );
+            // Not every key may read every part (statistics are admin-only): just leave it out.
+            let quiet = |what: &str, e: &anyhow::Error| log::debug!("server storage: {what}: {e:#}");
+            let storage = ServerStorage {
+                disk: disk.inspect_err(|e| quiet("disk", e)).ok(),
+                quota: quota.inspect_err(|e| quiet("quota", e)).ok(),
+                stats: stats.inspect_err(|e| quiet("statistics", e)).ok(),
+            };
+            let _ = tx.send(Bg::Storage(storage));
             wake();
         });
     }
@@ -345,6 +427,10 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
                 page.measured_at = Instant::now();
             }
             Bg::Server(r) => page.server = r.map_or_else(Server::Failed, Server::Ok),
+            Bg::Storage(st) => {
+                page.server_storage = Some(st);
+                page.storage_loading = false;
+            }
             Bg::Cleared(what, freed) => {
                 page.clearing = None;
                 page.flash = Some((what, format!("Freed {}", format_bytes(freed)), now));
@@ -414,19 +500,50 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     let scroll = page.scroll;
     let flash = |key: &str| page.flash.as_ref().filter(|f| f.0 == key).map(|f| f.1.clone());
 
-    let section = |ctx: &mut Ctx, y: &mut f32, key: &str, glyph: &str, color: u32, title: &str| {
+    let pal = theme::palette();
+    let section = |ctx: &mut Ctx, y: &mut f32, key: &str, icon: &'static str, color: u32, title: &str| {
         // Remember where each section starts, for `--settings-scroll <section>`.
         let offset = (*y - (top + 8.0 * s)) / s + scroll;
         ctx.anims.insert(format!("section:{key}"), offset);
         let mid = *y + 14.0 * s;
-        ctx.icon_tile(x + 2.0 * s, mid, glyph, color);
+        ctx.icon_tile(x + 2.0 * s, mid, icon, color);
         ctx.text(title, x + 36.0 * s, mid, 15.0, 700, theme::text(), Align::Left);
         *y += 38.0 * s;
     };
     let gap = 28.0 * s;
 
+    // --- Appearance ----------------------------------------------------------------------
+    section(&mut ctx, &mut y, "appearance", "palette", pal.accent, "Appearance");
+    let mut card = Card::begin(&ctx, x, y, cw);
+    let r = card.row(&mut ctx, ROW_SUB);
+    let name = theme::omarchy_name();
+    let sub = match (&name, st.follow_omarchy && theme::from_omarchy()) {
+        (Some(n), true) => format!("Using the “{n}” theme · changes apply live"),
+        (Some(n), false) if !st.follow_omarchy => format!("Classic palette · Omarchy theme “{n}” available"),
+        (Some(_), false) => "The Omarchy theme couldn't be read · using the classic palette".to_string(),
+        (None, _) => "No Omarchy theme found · using the classic palette".to_string(),
+    };
+    ctx.row_label_until(r, "Follow Omarchy theme", Some(&sub), true, right - 40.0 * s);
+    ctx.toggle("follow_omarchy", right, r[1] + r[3] / 2.0, &mut st.follow_omarchy, name.is_some());
+    let r = card.row(&mut ctx, ROW);
+    let mid = r[1] + r[3] / 2.0;
+    let mode = if pal.dark { "Dark" } else { "Light" };
+    ctx.row_label(r, "Palette", None, true);
+    let swatches = [pal.bg, pal.surface, pal.raised, pal.fg, pal.muted, pal.accent, pal.selection, pal.red, pal.green];
+    let (d, step) = ((18.0 * s).round(), (24.0 * s).round());
+    let mut sx = (right - d).round();
+    for &c in swatches.iter().rev() {
+        let ring = s.round().max(1.0);
+        let edge = pal.shade(colors::card(), 0.28);
+        ctx.quad([sx - ring, (mid - d / 2.0).round() - ring, d + 2.0 * ring, d + 2.0 * ring], rgb(edge, 1.0), d / 2.0 + ring);
+        ctx.quad([sx, (mid - d / 2.0).round(), d, d], rgb(c, 1.0), d / 2.0);
+        sx -= step;
+    }
+    ctx.text(mode, sx + step - 10.0 * s, mid, 12.5, 500, colors::text_secondary(), Align::Right);
+    y = card.end(&mut ctx) + gap;
+
     // --- Library & Grid ------------------------------------------------------------------
-    section(&mut ctx, &mut y, "grid", "\u{f00a}", 0x0a84ff, "Library & Grid");
+    section(&mut ctx, &mut y, "grid", "layout-grid", pal.tints[3], "Library & Grid");
     let mut card = Card::begin(&ctx, x, y, cw);
     let r = card.row(&mut ctx, ROW_SUB);
     let until = right - ctx.segmented_width(&["Small", "Medium", "Large"]);
@@ -455,7 +572,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     y = card.end(&mut ctx) + gap;
 
     // --- Scrolling & Gestures ------------------------------------------------------------
-    section(&mut ctx, &mut y, "scrolling", "\u{f0b2}", 0xbf5af2, "Scrolling & Gestures");
+    section(&mut ctx, &mut y, "scrolling", "hand", pal.tints[4], "Scrolling & Gestures");
     // Sliders give way on narrow windows so labels keep some room.
     let slider_w = (cw * 0.28).clamp(110.0 * s, 180.0 * s);
     let value_w = 64.0 * s;
@@ -467,7 +584,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     if ctx.slider("scroll_speed", right - value_w - slider_w, mid, slider_w, &mut v, 16) {
         st.scroll_speed = 0.5 + v * 1.5;
     }
-    ctx.text(format!("{:.1}×", st.scroll_speed), right, mid, 13.0, 500, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(format!("{:.1}×", st.scroll_speed), right, mid, 13.0, 500, colors::text_secondary(), Align::Right);
     let r = card.row(&mut ctx, ROW_SUB);
     ctx.row_label_until(r, "Pinch zoom speed", Some("How quickly the grid reflows as you pinch"), true, right - value_w - slider_w - 10.0 * s);
     let mid = r[1] + r[3] / 2.0;
@@ -475,14 +592,14 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     if ctx.slider("pinch_speed", right - value_w - slider_w, mid, slider_w, &mut v, 16) {
         st.pinch_speed = 0.5 + v * 1.5;
     }
-    ctx.text(format!("{:.1}×", st.pinch_speed), right, mid, 13.0, 500, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(format!("{:.1}×", st.pinch_speed), right, mid, 13.0, 500, colors::text_secondary(), Align::Right);
     let r = card.row(&mut ctx, ROW_SUB);
     ctx.row_label_until(r, "Momentum scrolling", Some("Keep gliding after a touchpad swipe"), true, right - 40.0 * s);
     ctx.toggle("momentum", right, r[1] + r[3] / 2.0, &mut st.momentum, true);
     y = card.end(&mut ctx) + gap;
 
     // --- Playback ------------------------------------------------------------------------
-    section(&mut ctx, &mut y, "playback", "\u{f04b}", 0xff375f, "Playback");
+    section(&mut ctx, &mut y, "playback", "film", pal.tints[0], "Playback");
     let mut card = Card::begin(&ctx, x, y, cw);
     let r = card.row(&mut ctx, ROW);
     ctx.row_label_until(r, "Autoplay videos in the viewer", None, true, right - 40.0 * s);
@@ -493,11 +610,11 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     let r = card.row(&mut ctx, ROW);
     ctx.row_label_until(r, "Default volume", None, true, right - value_w - slider_w - 30.0 * s);
     let mid = r[1] + r[3] / 2.0;
-    ctx.icon("\u{f026}", right - value_w - slider_w - 22.0 * s, mid, 13.0, colors::TEXT_SECONDARY);
+    ctx.icon("volume-1", right - value_w - slider_w - 20.0 * s, mid, 16.0, colors::text_secondary());
     if ctx.slider("volume", right - value_w - slider_w, mid, slider_w, &mut st.volume, 21) {
         st.volume = (st.volume * 20.0).round() / 20.0;
     }
-    ctx.text(format!("{:.0}%", st.volume * 100.0), right, mid, 13.0, 500, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(format!("{:.0}%", st.volume * 100.0), right, mid, 13.0, 500, colors::text_secondary(), Align::Right);
     let r = card.row(&mut ctx, ROW_SUB);
     ctx.row_label_until(r, "Play videos and Live Photos on hover", Some("In the grid, while the pointer rests on them"), true, right - 40.0 * s);
     ctx.toggle("hover_play", right, r[1] + r[3] / 2.0, &mut st.hover_play, true);
@@ -508,7 +625,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     y = card.end(&mut ctx) + gap;
 
     // --- Storage -------------------------------------------------------------------------
-    section(&mut ctx, &mut y, "storage", "\u{f1c0}", 0x30d158, "Storage");
+    section(&mut ctx, &mut y, "storage", "hard-drive", pal.tints[1], "Storage");
     let mut card = Card::begin(&ctx, x, y, cw);
     let r = card.row(&mut ctx, 92.0);
     storage_overview(&mut ctx, r, page.sizes.as_ref(), st.thumb_cache_bytes());
@@ -577,7 +694,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
         0 => "No limit".to_string(),
         mb => format_bytes(mb as u64 * (1 << 20)),
     };
-    ctx.text(label, right, mid, 13.0, 500, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(label, right, mid, 13.0, 500, colors::text_secondary(), Align::Right);
 
     let r = card.row(&mut ctx, ROW_SUB);
     let mid = r[1] + r[3] / 2.0;
@@ -605,10 +722,14 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
             });
         }
     }
-    y = card.end(&mut ctx) + gap;
+    y = card.end(&mut ctx);
+    if let Some(st) = page.server_storage.as_ref().filter(|st| st.disk.is_some() || st.quota.is_some() || st.stats.is_some()) {
+        y = server_storage(&mut ctx, x, y + 18.0 * s, cw, st);
+    }
+    y += gap;
 
     // --- GPU memory ----------------------------------------------------------------------
-    section(&mut ctx, &mut y, "gpu", "\u{f2db}", 0xff9f0a, "Graphics Memory");
+    section(&mut ctx, &mut y, "gpu", "cpu", pal.tints[2], "Graphics Memory");
     let mut card = Card::begin(&ctx, x, y, cw);
     let r = card.row(&mut ctx, ROW_SUB);
     let mid = r[1] + r[3] / 2.0;
@@ -635,37 +756,37 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
         group(slots[1]),
         group(slots[2])
     );
-    ctx.text(detail, right, mid, 12.5, 400, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(detail, right, mid, 12.5, 400, colors::text_secondary(), Align::Right);
     y = card.end(&mut ctx) + gap;
 
     // --- Server --------------------------------------------------------------------------
-    section(&mut ctx, &mut y, "server", "\u{f233}", 0x64d2ff, "Server");
+    section(&mut ctx, &mut y, "server", "server", pal.tints[5], "Server");
     let mut card = Card::begin(&ctx, x, y, cw);
     let r = card.row(&mut ctx, ROW);
     let mid = r[1] + r[3] / 2.0;
     ctx.row_label(r, "Immich server", None, true);
-    ctx.text(server_url, right, mid, 13.0, 400, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(server_url, right, mid, 13.0, 400, colors::text_secondary(), Align::Right);
     let r = card.row(&mut ctx, ROW_SUB);
     let mid = r[1] + r[3] / 2.0;
     let (dot, status, sub) = match &page.server {
-        Server::Demo => (0x8e8e93, "Offline demo".to_string(), "Run with an Immich server configured to connect".to_string()),
-        Server::Loading => (colors::ORANGE, "Connecting…".to_string(), "Asking the server for its version".to_string()),
+        Server::Demo => (pal.muted, "Offline demo".to_string(), "Run with an Immich server configured to connect".to_string()),
+        Server::Loading => (colors::pending(), "Connecting…".to_string(), "Asking the server for its version".to_string()),
         Server::Ok(i) => (
-            colors::GREEN,
+            colors::green(),
             format!("Connected · {} ms", i.latency.as_millis().max(1)),
             match &i.user {
                 Some(u) => format!("Immich {} · signed in as {u}", i.version),
                 None => format!("Immich {}", i.version),
             },
         ),
-        Server::Failed(e) => (colors::RED, "Can't reach the server".to_string(), e.clone()),
+        Server::Failed(e) => (colors::red(), "Can't reach the server".to_string(), e.clone()),
     };
     let dx = r[0] + 16.0 * s;
     ctx.quad([dx, mid - 12.5 * s, 8.0 * s, 8.0 * s], rgb(dot, 1.0), 4.0 * s);
     ctx.text(status, dx + 15.0 * s, mid - 8.5 * s, 13.5, 500, theme::text(), Align::Left);
     let sub_max = cw - 200.0 * s;
     let sub = ctx.ellipsize(&sub, 11.5, 400, sub_max);
-    ctx.text(sub, dx, mid + 9.5 * s, 11.5, 400, colors::TEXT_SECONDARY, Align::Left);
+    ctx.text(sub, dx, mid + 9.5 * s, 11.5, 400, colors::text_secondary(), Align::Left);
     let testing = matches!(page.server, Server::Loading);
     let (label, kind) = match page.server {
         Server::Loading => ("Testing…", ButtonKind::Secondary),
@@ -686,21 +807,21 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
         (_, Some((p, v))) => format!("{} photos · {} videos", group(p), group(v)),
         _ => "—".into(),
     };
-    ctx.text(counts, right, mid, 13.0, 400, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(counts, right, mid, 13.0, 400, colors::text_secondary(), Align::Right);
     y = card.end(&mut ctx) + gap;
 
     // --- About ---------------------------------------------------------------------------
-    section(&mut ctx, &mut y, "about", "\u{f05a}", 0x8e8e93, "About");
+    section(&mut ctx, &mut y, "about", "info", pal.muted, "About");
     let mut card = Card::begin(&ctx, x, y, cw);
     let r = card.row(&mut ctx, ROW);
     ctx.row_label(r, "Lumen", None, true);
-    ctx.text(format!("Version {}", env!("CARGO_PKG_VERSION")), right, r[1] + r[3] / 2.0, 13.0, 400, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(format!("Version {}", env!("CARGO_PKG_VERSION")), right, r[1] + r[3] / 2.0, 13.0, 400, colors::text_secondary(), Align::Right);
     let r = card.row(&mut ctx, ROW);
     ctx.row_label(r, "Graphics", None, true);
     let driver = if adapter.driver.is_empty() { String::new() } else { format!(" · {}", adapter.driver) };
     let gpu = format!("{} · {:?}{driver}", adapter.name, adapter.backend);
     let gpu = ctx.ellipsize(&gpu, 13.0, 400, cw - 140.0 * s);
-    ctx.text(gpu, right, r[1] + r[3] / 2.0, 13.0, 400, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(gpu, right, r[1] + r[3] / 2.0, 13.0, 400, colors::text_secondary(), Align::Right);
     let r = card.row(&mut ctx, ROW_SUB);
     let mid = r[1] + r[3] / 2.0;
     let dir = cache_dir().display().to_string();
@@ -799,23 +920,24 @@ fn storage_overview(ctx: &mut Ctx, r: [f32; 4], sizes: Option<&Sizes>, limit: u6
     let (x, w) = (r[0] + 16.0 * s, r[2] - 32.0 * s);
     let top = r[1] + 14.0 * s;
     let Some(z) = sizes else {
-        ctx.text("Calculating…", x, top + 12.0 * s, 13.5, 500, colors::TEXT_SECONDARY, Align::Left);
+        ctx.text("Calculating…", x, top + 12.0 * s, 13.5, 500, colors::text_secondary(), Align::Left);
         return;
     };
     let total = z.total();
     ctx.text(format_bytes(total), x, top + 10.0 * s, 20.0, 700, theme::text(), Align::Left);
     let tw = ctx.measure(&format_bytes(total), 20.0, 700);
-    ctx.text("used by Lumen on this computer", x + tw + 8.0 * s, top + 12.0 * s, 12.5, 400, colors::TEXT_SECONDARY, Align::Left);
+    ctx.text("used by Lumen on this computer", x + tw + 8.0 * s, top + 12.0 * s, 12.5, 400, colors::text_secondary(), Align::Left);
     let lim = if limit == 0 { "Thumbnails: no limit".to_string() } else { format!("Thumbnails limited to {}", format_bytes(limit)) };
-    ctx.text(lim, x + w, top + 12.0 * s, 12.0, 400, colors::TEXT_SECONDARY, Align::Right);
+    ctx.text(lim, x + w, top + 12.0 * s, 12.0, 400, colors::text_secondary(), Align::Right);
 
     let bar = [x, top + 30.0 * s, w, 10.0 * s];
-    ctx.quad(bar, rgb(colors::TRACK, 1.0), 5.0 * s);
+    ctx.quad(bar, rgb(colors::track(), 1.0), 5.0 * s);
+    let p = theme::palette();
     let parts = [
-        (z.thumbs.bytes, 0x0a84ff, "Thumbnails"),
-        (z.tiles.bytes, 0x30d158, "Map tiles"),
-        (z.metadata.bytes, 0xff9f0a, "Metadata"),
-        (z.other.bytes, 0x8e8e93, "Other"),
+        (z.thumbs.bytes, p.accent, "Thumbnails"),
+        (z.tiles.bytes, p.tints[3], "Map tiles"),
+        (z.metadata.bytes, p.tints[2], "Metadata"),
+        (z.other.bytes, p.muted, "Other"),
     ];
     // Scale against the thumbnail limit when there is one, so the bar shows headroom.
     let scale_to = if limit > 0 { (limit + z.tiles.bytes + z.metadata.bytes + z.other.bytes).max(total) } else { total };
@@ -841,7 +963,101 @@ fn storage_overview(ctx: &mut Ctx, r: [f32; 4], sizes: Option<&Sizes>, limit: u6
         }
         ctx.quad([lx, ly - 4.0 * s, 8.0 * s, 8.0 * s], rgb(c, 1.0), 4.0 * s);
         let label = format!("{name}  {}", format_bytes(b));
-        ctx.text(label.clone(), lx + 13.0 * s, ly, 12.0, 400, colors::TEXT_SECONDARY, Align::Left);
+        ctx.text(label.clone(), lx + 13.0 * s, ly, 12.0, 400, colors::text_secondary(), Align::Left);
         lx += 13.0 * s + ctx.measure(&label, 12.0, 400) + 22.0 * s;
     }
+}
+
+/// Storage › Server: the disk under the library, this user's usage and, for admins, the
+/// library's split and per-user usage. Starts at `y` (a caption above the card); returns the
+/// card's bottom.
+fn server_storage(ctx: &mut Ctx, x: f32, y: f32, cw: f32, st: &ServerStorage) -> f32 {
+    let s = ctx.s;
+    let p = theme::palette();
+    let right = x + cw - 16.0 * s;
+    ctx.text("Server", x + 16.0 * s, y + 8.0 * s, 12.0, 600, theme::text_faint(), Align::Left);
+    let mut card = Card::begin(ctx, x, y + 22.0 * s, cw);
+
+    if let Some(d) = &st.disk {
+        let pct = d.disk_usage_percentage.clamp(0.0, 100.0);
+        let warn = pct >= DISK_WARN;
+        let r = card.row(ctx, if warn { 104.0 } else { 86.0 });
+        let (lx, w) = (r[0] + 16.0 * s, r[2] - 32.0 * s);
+        let top = r[1] + 14.0 * s;
+        let used = format_bytes(d.disk_use_raw);
+        ctx.text(used.clone(), lx, top + 10.0 * s, 20.0, 700, theme::text(), Align::Left);
+        let tw = ctx.measure(&used, 20.0, 700);
+        let of = format!("of {} used on the server disk", format_bytes(d.disk_size_raw));
+        ctx.text(of, lx + tw + 8.0 * s, top + 12.0 * s, 12.5, 400, colors::text_secondary(), Align::Left);
+        let free = format!("{} free", format_bytes(d.disk_available_raw));
+        let free_color = if warn { theme::text_rgba(p.red, 1.0) } else { colors::text_secondary() };
+        ctx.text(free, lx + w, top + 12.0 * s, 12.5, if warn { 600 } else { 400 }, free_color, Align::Right);
+        let bar = [lx, top + 30.0 * s, w, 10.0 * s];
+        ctx.quad(bar, rgb(colors::track(), 1.0), 5.0 * s);
+        let fill = if warn { p.red } else if pct >= 75.0 { p.tints[2] } else { p.accent };
+        let fw = (w * (pct / 100.0) as f32).max(bar[3]);
+        ctx.quad([bar[0], bar[1], fw, bar[3]], rgb(fill, 1.0), 5.0 * s);
+        let ly = bar[1] + bar[3] + 16.0 * s;
+        ctx.text(format!("{pct:.1}% full"), lx, ly, 12.0, 500, colors::text_secondary(), Align::Left);
+        if warn {
+            let ny = ly + 20.0 * s;
+            let px = crate::widgets::even_with(16.0 * s, 15.0 * s);
+            ctx.layer.icon_styled("triangle-alert", [(lx + px / 2.0).round(), ny.round()], px, rgb(p.red, 1.0), IconStyle::weight(2.0));
+            let note = "Server disk almost full — uploads may fail";
+            ctx.text(note, lx + px + 7.0 * s, ny, 12.5, 600, theme::text_rgba(p.red, 1.0), Align::Left);
+        }
+    }
+
+    if let Some(q) = &st.quota
+        && let Some(used) = q.quota_usage_in_bytes
+    {
+        let r = card.row(ctx, ROW_SUB);
+        let mid = r[1] + r[3] / 2.0;
+        let (sub, value) = match q.quota_size_in_bytes.filter(|&q| q > 0) {
+            Some(quota) => {
+                let pct = used as f64 / quota as f64 * 100.0;
+                (format!("{pct:.0}% of your {} quota", format_bytes(quota)), format!("{} of {}", format_bytes(used), format_bytes(quota)))
+            }
+            None => ("Photos and videos you own · no quota".to_string(), format_bytes(used)),
+        };
+        let vw = ctx.measure(&value, 13.0, 500);
+        ctx.row_label_until(r, "Your library", Some(&sub), true, right - vw);
+        ctx.text(value, right, mid, 13.0, 500, colors::text_secondary(), Align::Right);
+    }
+
+    if let Some(t) = &st.stats {
+        let r = card.row(ctx, ROW_SUB);
+        let mid = r[1] + r[3] / 2.0;
+        let mut sub = format!("{} photos · {} videos", group(t.photos as usize), group(t.videos as usize));
+        if let (Some(ph), Some(vi)) = (t.usage_photos, t.usage_videos) {
+            sub += &format!("  ·  photos {}, videos {}", format_bytes(ph), format_bytes(vi));
+        }
+        let value = format_bytes(t.usage);
+        let vw = ctx.measure(&value, 13.0, 500);
+        ctx.row_label_until(r, "Everyone's libraries", Some(&sub), true, right - vw);
+        ctx.text(value, right, mid, 13.0, 500, colors::text_secondary(), Align::Right);
+
+        if t.usage_by_user.len() > 1 {
+            let mut users: Vec<&UserUsage> = t.usage_by_user.iter().collect();
+            users.sort_by_key(|u| std::cmp::Reverse(u.usage));
+            let max = users.first().map_or(1, |u| u.usage.max(1));
+            for u in users.into_iter().take(8) {
+                let r = card.row(ctx, ROW_SUB);
+                let mid = r[1] + r[3] / 2.0;
+                let sub = format!("{} photos · {} videos", group(u.photos as usize), group(u.videos as usize));
+                let value = format_bytes(u.usage);
+                // A slim bar of each user's share, right-aligned before the figure.
+                let bw = (cw * 0.22).clamp(70.0 * s, 140.0 * s);
+                let vx = right - 64.0 * s;
+                let bx = vx - 12.0 * s - bw;
+                let th = 4.0 * s;
+                ctx.quad([bx, mid - th / 2.0, bw, th], rgb(colors::track(), 1.0), th / 2.0);
+                let f = (u.usage as f32 / max as f32).clamp(0.0, 1.0);
+                ctx.quad([bx, mid - th / 2.0, (bw * f).max(th), th], rgb(p.accent, 1.0), th / 2.0);
+                ctx.row_label_until(r, &u.user_name, Some(&sub), true, bx);
+                ctx.text(value, right, mid, 13.0, 500, colors::text_secondary(), Align::Right);
+            }
+        }
+    }
+    card.end(ctx)
 }

@@ -29,6 +29,9 @@ pub struct Palette {
     pub selection: u32,
     pub red: u32,
     pub green: u32,
+    /// Terminal hues (red, green, yellow, blue, magenta, cyan) for section tiles and charts.
+    /// Under matugen these are tonal roles rather than true hues, but they belong to the theme.
+    pub tints: [u32; 6],
 }
 
 impl Palette {
@@ -46,11 +49,58 @@ impl Palette {
         selection: 0x0a84ff,
         red: 0xff453a,
         green: 0x30d158,
+        tints: [0xff453a, 0x30d158, 0xff9f0a, 0x0a84ff, 0xbf5af2, 0x64d2ff],
     };
+
+    /// Grouped-card background (Settings, sheets): a step up from `bg`.
+    pub fn card(&self) -> u32 {
+        if self.dark { self.surface } else { self.raised }
+    }
+
+    /// `base` moved towards the foreground by `t`: hover fills, tracks, hairlines.
+    pub fn shade(&self, base: u32, t: f32) -> u32 {
+        mix(base, self.fg, t)
+    }
+}
+
+/// The grid header's gradient (and what leaving tiles fade to): the background itself, so
+/// titles in `fg` stay readable over photos in light and dark themes.
+pub fn scrim() -> u32 {
+    palette().bg
+}
+
+/// Readable text/icon colour on a solid `bg`.
+pub fn on(bg: u32) -> u32 {
+    if luminance(bg) > 0.55 { 0x16171a } else { 0xffffff }
+}
+
+/// Colours for chrome drawn over photos and video (viewer bars, pills, HUDs). The viewer keeps a
+/// dark surround in every theme, so this stays dark glass with light text even in light mode.
+#[derive(Clone, Copy, Debug)]
+pub struct Hud {
+    /// The viewer's backdrop.
+    pub backdrop: u32,
+    /// Opaque-ish panels and bars over it.
+    pub glass: u32,
+    pub fg: u32,
+    pub fg_dim: u32,
+    /// The theme's red, or a bright one when the theme's is meant for light backgrounds.
+    pub red: u32,
+}
+
+pub fn hud() -> Hud {
+    let p = palette();
+    if p.dark {
+        Hud { backdrop: p.bg, glass: mix(p.surface, 0x000000, 0.15), fg: mix(p.fg, 0xffffff, 0.35), fg_dim: p.fg_dim, red: p.red }
+    } else {
+        Hud { backdrop: 0x0b0b0d, glass: 0x1c1c1e, fg: 0xf5f5f7, fg_dim: 0xc7c7cc, red: 0xff453a }
+    }
 }
 
 static PALETTE: RwLock<Palette> = RwLock::new(Palette::CLASSIC);
 static FOLLOW: AtomicBool = AtomicBool::new(true);
+/// The palette in use came from an Omarchy theme file.
+static OMARCHY: AtomicBool = AtomicBool::new(false);
 /// Bumped on every change, so caches keyed on colour can notice.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -60,6 +110,26 @@ pub fn palette() -> Palette {
 
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
+}
+
+/// True while the colours come from Omarchy (false: classic, by choice or for want of a theme).
+pub fn from_omarchy() -> bool {
+    OMARCHY.load(Ordering::Relaxed)
+}
+
+/// The current Omarchy theme's name (`~/.local/state/omarchy/current/theme.name`), if any.
+pub fn omarchy_name() -> Option<String> {
+    if let Some(p) = std::env::var_os("LUMEN_THEME_FILE") {
+        let p = PathBuf::from(p);
+        return p.exists().then(|| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    }
+    let home = dirs::home_dir()?;
+    [".local/state/omarchy/current/theme.name", ".config/omarchy/current/theme.name"]
+        .into_iter()
+        .find_map(|p| std::fs::read_to_string(home.join(p)).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| omarchy_path().map(|_| "Omarchy".to_string()))
 }
 
 /// Settings › Appearance: follow Omarchy, or keep the classic palette.
@@ -83,11 +153,12 @@ pub fn omarchy_path() -> Option<PathBuf> {
 
 /// Re-reads the theme; returns true if the palette changed.
 pub fn reload() -> bool {
-    let next = if FOLLOW.load(Ordering::Relaxed) {
-        omarchy_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| parse(&s)).unwrap_or(Palette::CLASSIC)
-    } else {
-        Palette::CLASSIC
-    };
+    let theme = FOLLOW
+        .load(Ordering::Relaxed)
+        .then(|| omarchy_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| parse(&s)))
+        .flatten();
+    OMARCHY.store(theme.is_some(), Ordering::Relaxed);
+    let next = theme.unwrap_or(Palette::CLASSIC);
     let mut cur = PALETTE.write().unwrap();
     if *cur == next {
         return false;
@@ -145,15 +216,20 @@ fn parse(toml: &str) -> Option<Palette> {
         bg: if dark { darker } else { bg },
         surface: if dark { dark_bg } else { darker },
         raised: lighter,
-        separator: mix(lighter, bg, 0.35),
+        separator: if dark { mix(lighter, bg, 0.35) } else { mix(bg, fg, 0.13) },
         fg,
         fg_dim: get("dark_foreground").unwrap_or(mix(fg, bg, 0.3)),
         muted: get("muted").unwrap_or(mix(fg, bg, 0.45)),
         accent,
-        on_accent: if luminance(accent) > 0.5 { darker } else { 0xffffff },
+        // A light accent needs dark text: the deepest background when dark, the text colour when light.
+        on_accent: if luminance(accent) > 0.5 { if dark { darker } else { fg } } else { 0xffffff },
         selection: get("selection").unwrap_or(accent),
-        red: get("red").unwrap_or(0xff453a),
-        green: get("green").unwrap_or(0x30d158),
+        red: get("red").unwrap_or(if dark { 0xff453a } else { 0xd70015 }),
+        green: get("green").unwrap_or(if dark { 0x30d158 } else { 0x248a3d }),
+        tints: {
+            let keys = ["red", "green", "yellow", "blue", "magenta", "cyan"];
+            std::array::from_fn(|i| get(keys[i]).unwrap_or(Palette::CLASSIC.tints[i]))
+        },
     })
 }
 
@@ -191,14 +267,19 @@ pub fn separator() -> u32 {
 pub fn accent() -> u32 {
     palette().accent
 }
+// Dark text on light blends thinner (coverage is blended in linear light), so light themes
+// get full opacity.
 pub fn text() -> [u8; 4] {
-    text_rgba(palette().fg, 0.92)
+    let p = palette();
+    text_rgba(p.fg, if p.dark { 0.92 } else { 1.0 })
 }
 pub fn text_dim() -> [u8; 4] {
-    text_rgba(palette().fg_dim, 0.85)
+    let p = palette();
+    text_rgba(p.fg_dim, if p.dark { 0.85 } else { 1.0 })
 }
 pub fn text_faint() -> [u8; 4] {
-    text_rgba(palette().muted, 0.8)
+    let p = palette();
+    text_rgba(p.muted, if p.dark { 0.8 } else { 1.0 })
 }
 
 #[cfg(test)]

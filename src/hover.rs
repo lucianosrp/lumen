@@ -17,6 +17,7 @@ use crate::immich::Immich;
 use crate::library::{Asset, Library};
 use crate::loader::Source;
 use crate::render::{Instance, Renderer};
+use crate::icons::IconStyle;
 use crate::ui::{Align, ImageId, Layer, Quad, Text, contains, rgb};
 use crate::video::{self, Options, Player};
 
@@ -29,8 +30,6 @@ const BADGE_MIN: f32 = 90.0;
 const PREVIEW_MAX: u32 = 1280;
 const FADE_IN: f32 = 0.25;
 const FADE_OUT: f32 = 0.2;
-/// Nerd Font "md-bullseye": a dot in two rings, like Apple's Live Photo mark.
-pub const LIVE_GLYPH: &str = "\u{f05dd}";
 
 // ---------------------------------------------------------------------------------------------
 // Clip
@@ -375,22 +374,31 @@ fn badges(out: &mut Layer, tiles: &[Instance], lib: &Library, s: f32, scrim_h: f
                 let band = [x, top + gh * b as f32 / bands as f32, w, gh / bands as f32 + 0.5];
                 out.quad(Quad::solid(band, rgb(0x000000, 0.32 * f * f * k), 0.0));
             }
-            let label = a.duration_ms.map_or_else(|| "\u{f04b}".to_string(), clock);
             let ty = y + h - pad - size * 1.25;
             let k = 1.0 - scrim_alpha(ty, scrim_h) / 0.86;
-            let icon = a.duration_ms.is_none();
-            let text = |dx: f32, color: [u8; 4]| {
-                let t = Text::new(label.clone(), x + w - pad + dx, ty + dx, size).weight(600).align(Align::Right).color(color);
-                if icon { t.icon() } else { t }
-            };
-            out.text(text(shadow, [0, 0, 0, (120.0 * k) as u8]));
-            out.text(text(0.0, [255, 255, 255, (240.0 * k) as u8]));
+            match a.duration_ms.map(clock) {
+                Some(label) => {
+                    let text = |dx: f32, color: [u8; 4]| {
+                        Text::new(label.clone(), x + w - pad + dx, ty + dx, size).weight(600).align(Align::Right).color(color)
+                    };
+                    out.text(text(shadow, [0, 0, 0, (120.0 * k) as u8]));
+                    out.text(text(0.0, [255, 255, 255, (240.0 * k) as u8]));
+                }
+                None => {
+                    // No duration known: a small play mark in the same corner.
+                    let px = size.round();
+                    let c = [(x + w - pad - px / 2.0).round(), (ty + size * 0.625).round()];
+                    out.icon_styled("play", [c[0] + shadow, c[1] + shadow], px, [0.0, 0.0, 0.0, 0.47 * k], IconStyle::filled());
+                    out.icon_styled("play", c, px, [1.0, 1.0, 1.0, 0.94 * k], IconStyle::filled());
+                }
+            }
         } else {
-            let gs = size * 1.25;
+            let px = (size * 1.4).round();
             let k = 1.0 - scrim_alpha(y + pad, scrim_h) / 0.86;
-            let glyph = |dx: f32, color: [u8; 4]| Text::new(LIVE_GLYPH, x + pad + dx, y + pad + dx, gs).icon().color(color);
-            out.text(glyph(shadow, [0, 0, 0, (120.0 * k) as u8]));
-            out.text(glyph(0.0, [255, 255, 255, (235.0 * k) as u8]));
+            let c = [(x + pad + px / 2.0).round(), (y + pad + px / 2.0).round()];
+            let style = IconStyle::weight(2.25);
+            out.icon_styled("live-photo", [c[0] + shadow, c[1] + shadow], px, [0.0, 0.0, 0.0, 0.47 * k], style);
+            out.icon_styled("live-photo", c, px, [1.0, 1.0, 1.0, 0.92 * k], style);
         }
     }
 }
@@ -415,7 +423,7 @@ fn scrim(out: &mut Layer, rect: [f32; 4], alpha: f32, h: f32) {
     for b in 0..bands {
         let y = y0 + bh * b as f32;
         let a = scrim_alpha(y + bh / 2.0, h) * alpha;
-        out.quad(Quad::solid([rect[0], y, rect[2], bh + 0.5], rgb(0x000000, a), 0.0));
+        out.quad(Quad::solid([rect[0], y, rect[2], bh + 0.5], rgb(crate::theme::scrim(), a), 0.0));
     }
 }
 

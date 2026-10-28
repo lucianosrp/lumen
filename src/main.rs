@@ -805,6 +805,9 @@ struct Shot {
     hover: Option<String>,
     hover_wait: u64,
     actions: Option<actions::Shot>,
+    /// `--theme-wait <secs>`: before rendering, wait (up to that long) for the theme file to
+    /// change, to check that a live palette switch recolours everything.
+    theme_wait: Option<u64>,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -1011,6 +1014,18 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
         core.pump();
         core.update(Instant::now());
     }
+    if let Some(secs) = shot.theme_wait {
+        let generation = theme::generation();
+        println!("waiting up to {secs} s for the theme to change");
+        let start = Instant::now();
+        while theme::generation() == generation && start.elapsed() < Duration::from_secs(secs) {
+            std::thread::sleep(Duration::from_millis(50));
+            core.pump();
+            core.update(Instant::now());
+        }
+        println!("theme generation {generation} -> {}", theme::generation());
+        settle(&mut core)?;
+    }
     let device = &core.renderer.device;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -1132,6 +1147,7 @@ fn main() -> Result<()> {
             page: settings_ui::Shot::parse(&args),
             hover: flag("--hover"),
             hover_wait: flag("--hover-wait").and_then(|s| s.parse().ok()).unwrap_or(0),
+            theme_wait: flag("--theme-wait").and_then(|s| s.parse().ok()),
         };
         return screenshot(source, &path, size, scale, shot);
     }

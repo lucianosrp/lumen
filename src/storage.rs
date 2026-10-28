@@ -219,7 +219,9 @@ pub fn format_bytes(b: u64) -> String {
     } else if b < K * K * K {
         let mb = b / (K * K);
         if mb < 10.0 { format!("{mb:.1} MB") } else { format!("{mb:.0} MB") }
-    } else {
+    } else if b < K * K * K * K {
         format!("{:.1} GB", b / (K * K * K))
+    } else {
+        format!("{:.2} TB", b / (K * K * K * K))
     }
 }

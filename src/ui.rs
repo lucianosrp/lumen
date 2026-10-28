@@ -17,8 +17,6 @@ pub enum Align {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Font {
     Sans,
-    /// Nerd Font glyphs, e.g. "\u{f03e}" (image), "\u{f004}" (heart).
-    Icons,
 }
 
 #[derive(Clone, Debug)]
@@ -85,10 +83,6 @@ impl Text {
         self.color = c;
         self
     }
-    pub fn icon(mut self) -> Self {
-        self.font = Font::Icons;
-        self
-    }
     pub fn align(mut self, a: Align) -> Self {
         self.align = a;
         self
@@ -127,6 +121,23 @@ impl Layer {
         let key = crate::icons::IconKey { name, px: px as u16, weight: (style.weight * 100.0) as u16, filled: style.filled };
         self.quads.push(Quad { rect, color, radius: 0.0, image: None, uv: [0.0, 0.0, 1.0, 1.0], icon: Some(key) });
     }
+    /// Clips the last quad to `clip`, adjusting its texture coordinates (for icons and images
+    /// in scrolling lists); drops it when nothing is left.
+    pub fn clip_last(&mut self, clip: [f32; 4]) {
+        let Some(q) = self.quads.last_mut() else { return };
+        let r = q.rect;
+        let (x0, y0) = (r[0].max(clip[0]), r[1].max(clip[1]));
+        let (x1, y1) = ((r[0] + r[2]).min(clip[0] + clip[2]), (r[1] + r[3]).min(clip[1] + clip[3]));
+        if x1 <= x0 || y1 <= y0 {
+            self.quads.pop();
+            return;
+        }
+        let [u0, v0, u1, v1] = q.uv;
+        let (fu, fv) = ((u1 - u0) / r[2], (v1 - v0) / r[3]);
+        q.uv = [u0 + (x0 - r[0]) * fu, v0 + (y0 - r[1]) * fv, u0 + (x1 - r[0]) * fu, v0 + (y1 - r[1]) * fv];
+        q.rect = [x0, y0, x1 - x0, y1 - y0];
+    }
+
     pub fn text(&mut self, t: Text) {
         self.texts.push(t);
     }

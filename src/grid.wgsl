@@ -6,6 +6,9 @@ struct Globals {
     xl: vec4f,
     xl_size: vec4f, // atlas width, height
     sizes: vec4f,   // small atlas width, height; large atlas width, height
+    accent: vec4f,  // theme colours, linear: selection, the tick on it, background/scrim
+    on_accent: vec4f,
+    bg: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -83,15 +86,16 @@ fn fs_tile(v: VOut) -> @location(0) vec4f {
     }
     // Trashed/archived tiles dim away before the grid closes the gap.
     let leaving = f32((v.flags >> 8u) & 255u) / 255.0;
-    return vec4f(mix(c.rgb, vec3f(0.004, 0.004, 0.005), leaving), 1.0);
+    return vec4f(mix(c.rgb, g.bg.rgb, leaving), 1.0);
 }
 
-// Apple-style selection: the photo dims slightly inside a thin accent inset, with a blue
-// check badge in the bottom-right corner (white ring, white tick). All SDFs in tile pixels.
+// Apple-style selection: the photo dims slightly inside a thin accent inset, with an accent
+// check badge in the bottom-right corner (white ring, tick in the accent's text colour).
+// All SDFs in tile pixels.
 fn selected(rgb: vec3f, uv: vec2f, size: f32) -> vec3f {
     let px = uv * size;
     let s = g.view.w;
-    let accent = vec3f(0.0030, 0.235, 1.0); // #0a84ff in linear light
+    let accent = g.accent.rgb;
     var c = rgb * 0.72;
     let inset = min(min(px.x, px.y), min(size - px.x, size - px.y));
     let ring = clamp(min(2.5 * s, size * 0.04), 1.0, 3.0 * s);
@@ -108,7 +112,7 @@ fn selected(rgb: vec3f, uv: vec2f, size: f32) -> vec3f {
     let q = (px - center) / r;
     let tick = min(segment(q, vec2f(-0.45, 0.02), vec2f(-0.12, 0.33)), segment(q, vec2f(-0.12, 0.33), vec2f(0.45, -0.3)));
     let w = 0.11;
-    c = mix(c, vec3f(1.0), clamp((w - tick) * r + 0.5, 0.0, 1.0));
+    c = mix(c, g.on_accent.rgb, clamp((w - tick) * r + 0.5, 0.0, 1.0));
     return c;
 }
 
@@ -119,7 +123,7 @@ fn segment(p: vec2f, a: vec2f, b: vec2f) -> f32 {
     return length(pa - ba * h);
 }
 
-// Header scrim: content scrolls underneath a soft dark gradient.
+// Header scrim: content scrolls underneath a soft gradient of the background colour.
 struct OOut {
     @builtin(position) pos: vec4f,
     @location(0) y: f32,
@@ -138,5 +142,5 @@ fn vs_header(@builtin(vertex_index) vi: u32) -> OOut {
 @fragment
 fn fs_header(o: OOut) -> @location(0) vec4f {
     let a = 0.86 * (1.0 - smoothstep(0.0, 1.0, o.y));
-    return vec4f(0.0, 0.0, 0.0, a);
+    return vec4f(g.bg.rgb, a);
 }

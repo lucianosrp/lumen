@@ -287,15 +287,15 @@ impl Sidebar {
         let open = |key: &str, label: &str, icon, c| row(key, label, icon, Target::Open(c));
         let mut items = vec![
             Item::Header("Photos"),
-            open("library", "Library", "\u{f03e}", Collection::library()),
+            open("library", "Library", "images", Collection::library()),
             Item::Header("Pinned"),
-            open("favorites", "Favorites", "\u{f004}", Collection::favorites()),
-            open("videos", "Videos", "\u{f03d}", Collection::videos()),
-            row("places", "Places", "\u{f279}", Target::Places),
-            row("people", "People", "\u{f0c0}", Target::People),
+            open("favorites", "Favorites", "heart", Collection::favorites()),
+            open("videos", "Videos", "video", Collection::videos()),
+            row("places", "Places", "map", Target::Places),
+            row("people", "People", "users", Target::People),
             Item::Header("Utilities"),
-            open("archive", "Archive", "\u{f187}", Collection::archive()),
-            open("trash", "Recently Deleted", "\u{f1f8}", Collection::trash()),
+            open("archive", "Archive", "archive", Collection::archive()),
+            open("trash", "Recently Deleted", "trash-2", Collection::trash()),
         ];
         if !self.albums.is_empty() {
             items.push(Item::Header("Albums"));
@@ -405,25 +405,17 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         let pill = [x0 + 10.0 * s, y, width - 20.0 * s, ROW * s];
         let selected = row.key == sb.selected;
         let hovered = hover.is_some_and(|c| crate::ui::contains(pill, c.0, c.1));
-        if selected {
-            base.quad(Quad::solid(pill, rgb(theme::accent(), 1.0), 7.0 * s));
-        } else if hovered {
-            // Opaque: a translucent white blended in linear space comes out far too bright.
-            base.quad(Quad::solid(pill, rgb(0x2a2a2e, 1.0), 7.0 * s));
-        }
+        let p = theme::palette();
+        pill_bg(base, pill, selected, hovered, s);
         let mid = y + ROW * s / 2.0;
         match row.look {
-            Look::Icon(icon) => {
-                let color = if selected { theme::text() } else { [64, 156, 255, 255] };
-                let size = 15.0 * s;
-                base.text(Text::new(icon, x0 + 31.0 * s, mid - size * 0.625, size).icon().color(color).align(Align::Center).clip(clip));
-            }
+            Look::Icon(icon) => row_icon(base, icon, x0, mid, selected, s),
             Look::Square | Look::Circle => {
                 let r = if matches!(row.look, Look::Circle) { THUMB / 2.0 } else { 5.0 } * s;
                 let rect = [x0 + 20.0 * s, mid - THUMB * s / 2.0, THUMB * s, THUMB * s];
                 match sb.images.get(&row.key) {
                     Some(&img) => base.quad(Quad::image(rect, img, [0.0, 0.0, 1.0, 1.0], 1.0, r)),
-                    None => base.quad(Quad::solid(rect, rgb(0x2c2c30, 1.0), r)),
+                    None => base.quad(Quad::solid(rect, rgb(p.shade(p.surface, 0.1), 1.0), r)),
                 }
             }
         }
@@ -432,7 +424,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         let right = x0 + width - 22.0 * s;
         let mut avail = right - (x0 + 52.0 * s);
         if let Some(count) = &row.count {
-            let color = if selected { [255, 255, 255, 200] } else { theme::text_faint() };
+            let color = if selected { theme::text_rgba(p.on_accent, 0.75) } else { theme::text_faint() };
             base.text(Text::new(count.clone(), right, mid - count_size * 0.625, count_size).weight(500).color(color).align(Align::Right).clip(clip));
             avail -= uir.measure(count, count_size, 500, Font::Sans) + 10.0 * s;
         }
@@ -445,10 +437,30 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
                 l
             }
         };
-        let color = if selected { [255, 255, 255, 255] } else { theme::text() };
+        let color = if selected { theme::text_rgba(p.on_accent, 1.0) } else { theme::text() };
         base.text(Text::new(label, x0 + 52.0 * s, mid - text_size * 0.625, text_size).weight(500).color(color).clip(clip));
     }
     draw_footer(sb, base, s, x0, h);
+}
+
+/// The selected (accent) or hovered row background.
+fn pill_bg(base: &mut crate::ui::Layer, pill: [f32; 4], selected: bool, hovered: bool, s: f32) {
+    let p = theme::palette();
+    if selected {
+        base.quad(Quad::solid(pill, rgb(p.accent, 1.0), 7.0 * s));
+    } else if hovered {
+        // Opaque: a translucent white blended in linear space comes out far too bright.
+        base.quad(Quad::solid(pill, rgb(p.shade(p.surface, if p.dark { 0.08 } else { 0.07 }), 1.0), 7.0 * s));
+    }
+}
+
+/// A row's symbol, in the accent colour (or the accent's text colour on the selected pill).
+fn row_icon(base: &mut crate::ui::Layer, icon: &'static str, x0: f32, mid: f32, selected: bool, s: f32) {
+    let p = theme::palette();
+    let color = if selected { p.on_accent } else { p.accent };
+    let px = crate::widgets::even_with((ROW * s).round(), 17.0 * s);
+    let style = crate::icons::IconStyle::weight(crate::widgets::ICON_WEIGHT);
+    base.icon_styled(icon, [(x0 + 31.0 * s).round(), mid.round()], px, rgb(color, 1.0), style);
 }
 
 /// Settings row pinned under the scrolling list, over an opaque strip (feat/settings).
@@ -462,16 +474,11 @@ fn draw_footer(sb: &Sidebar, base: &mut crate::ui::Layer, s: f32, x0: f32, h: f3
     let pill = [x0 + 10.0 * s, top + (FOOTER - ROW) / 2.0 * s, width - 20.0 * s, ROW * s];
     let selected = sb.selected == "settings";
     let hovered = sb.contains(sb.cursor, s) && crate::ui::contains(pill, sb.cursor.0, sb.cursor.1);
-    if selected {
-        base.quad(Quad::solid(pill, rgb(theme::accent(), 1.0), 7.0 * s));
-    } else if hovered {
-        base.quad(Quad::solid(pill, rgb(0x2a2a2e, 1.0), 7.0 * s));
-    }
+    pill_bg(base, pill, selected, hovered, s);
     let mid = pill[1] + ROW * s / 2.0;
-    let (icon, text) = (15.0 * s, 13.0 * s);
-    let color = if selected { theme::text() } else { [64, 156, 255, 255] };
-    base.text(Text::new("\u{f013}", x0 + 31.0 * s, mid - icon * 0.625, icon).icon().color(color).align(Align::Center));
-    let color = if selected { [255, 255, 255, 255] } else { theme::text() };
+    let text = 13.0 * s;
+    row_icon(base, "settings", x0, mid, selected, s);
+    let color = if selected { theme::text_rgba(theme::palette().on_accent, 1.0) } else { theme::text() };
     base.text(Text::new("Settings", x0 + 52.0 * s, mid - text * 0.625, text).weight(500).color(color));
 }
 

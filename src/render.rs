@@ -36,6 +36,11 @@ struct Globals {
     xl_size: [f32; 4],
     /// Small atlas width, height; large atlas width, height.
     sizes: [f32; 4],
+    /// Theme colours in linear light: selection accent, the tick on it, and the background
+    /// (leaving tiles fade to it; the header scrim is made of it).
+    accent: [f32; 4],
+    on_accent: [f32; 4],
+    bg: [f32; 4],
 }
 
 /// Atlas texture size per tier for a memory budget, clamped to what the GPU supports.
@@ -496,6 +501,9 @@ impl Renderer {
             xl: self.xl.globals(),
             xl_size: [self.xl.width as f32, self.xl.height as f32, 0.0, 0.0],
             sizes: [self.small.width as f32, self.small.height as f32, self.large.width as f32, self.large.height as f32],
+            accent: linear(crate::theme::palette().accent),
+            on_accent: linear(crate::theme::palette().on_accent),
+            bg: linear(crate::theme::scrim()),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
         let bytes = std::mem::size_of_val(tiles) as u64;
@@ -544,9 +552,15 @@ impl Renderer {
     }
 }
 
-/// The theme background, linearised for the (sRGB) render target.
+/// A palette colour in linear light, for shaders writing to the sRGB target.
+fn linear(hex: u32) -> [f32; 4] {
+    let [r, g, b, _] = crate::theme::rgba(hex, 1.0);
+    let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    [lin(r), lin(g), lin(b), 1.0]
+}
+
+/// The theme background.
 fn clear_color() -> wgpu::Color {
-    let [r, g, b, _] = crate::theme::rgba(crate::theme::bg(), 1.0);
-    let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } as f64;
-    wgpu::Color { r: lin(r), g: lin(g), b: lin(b), a: 1.0 }
+    let [r, g, b, _] = linear(crate::theme::bg());
+    wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
 }

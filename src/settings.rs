@@ -103,6 +103,9 @@ pub struct Settings {
     pub thumb_cache_mb: u32,
     // GPU
     pub gpu_memory: GpuMemory,
+    // Appearance
+    /// Colours follow the Omarchy theme (and wallpaper, via matugen); off keeps the classic palette.
+    pub follow_omarchy: bool,
 }
 
 impl Default for Settings {
@@ -121,6 +124,7 @@ impl Default for Settings {
             hover_sound: false,
             thumb_cache_mb: 2048,
             gpu_memory: GpuMemory::Normal,
+            follow_omarchy: true,
         }
     }
 }
@@ -218,4 +222,5 @@ pub fn apply(core: &mut Core) {
     crate::video::LOOP_SHORT.store(s.loop_short, Ordering::Relaxed);
     crate::storage::set_thumb_limit(s.thumb_cache_bytes());
     core.renderer.set_gpu_memory(s.gpu_memory);
+    crate::theme::set_follow_omarchy(s.follow_omarchy);
 }

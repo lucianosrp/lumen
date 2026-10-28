@@ -15,12 +15,14 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, Wind
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::grid::{Layout, Spec};
-use crate::hover::{self, Clip};
+use crate::hover::Clip;
 use crate::library::{self, Library};
 use crate::loader::{Loader, Source, thumbnail_bytes};
 use crate::render::Renderer;
 use crate::ui::{Align, ImageId, Layer, Quad, Text, contains, rgb, theme};
 use crate::video::{self, Player};
+use crate::icons::IconStyle;
+use crate::widgets::{ICON_WEIGHT, ROUND, State, TOOLBAR_Y, round_button};
 
 const OPEN_TIME: f32 = 0.30;
 const CLOSE_TIME: f32 = 0.28;
@@ -1121,7 +1123,7 @@ impl Viewer {
         let fade = |t: &Tex| (now.duration_since(t.at).as_secs_f32() / FADE_TIME).min(1.0);
         let base = (0..4).rev().find(|&k| slot.tex[k].as_ref().is_some_and(|t| fade(t) >= 1.0));
         if base.is_none() {
-            out.quad(Quad::solid(clip, rgb(0x26262a, alpha), 0.0));
+            out.quad(Quad::solid(clip, rgb(theme::mix(theme::hud().backdrop, 0xffffff, 0.1), alpha), 0.0));
         }
         let mut fading = false;
         for k in base.unwrap_or(0)..4 {
@@ -1222,7 +1224,8 @@ impl Viewer {
             o.clip = clip;
         }
 
-        out.quad(Quad::solid(screen, rgb(0x000000, backdrop), 0.0));
+        // Photos want a dark surround in every theme.
+        out.quad(Quad::solid(screen, rgb(theme::hud().backdrop, backdrop), 0.0));
 
         // Paging slides the old photo out and the new one in.
         let mut dx = 0.0;
@@ -1323,15 +1326,16 @@ impl Viewer {
         } else if failed || player.is_none_or(|p| !p.is_playing()) {
             let rad = 38.0 * s;
             let rect = [c.0 - rad, c.1 - rad, rad * 2.0, rad * 2.0];
+            let hud = theme::hud();
+            let over = contains(rect, o.cursor.0, o.cursor.1);
             out.quad(Quad::solid(rect, rgb(0x000000, 0.45 * progress), rad));
-            out.quad(Quad::solid(rect, rgb(0xffffff, 0.12 * progress), rad));
-            let (glyph, nudge) = if player.is_some_and(|p| p.ended) { ("\u{f01e}", 0.0) } else { ("\u{f04b}", 3.0) };
-            out.text(
-                Text::new(glyph, c.0 + nudge * s, c.1 - 19.0 * s, 30.0 * s)
-                    .icon()
-                    .align(Align::Center)
-                    .color(fade_color(theme::text(), progress)),
-            );
+            out.quad(Quad::solid(rect, rgb(0xffffff, if over { 0.2 } else { 0.12 } * progress), rad));
+            let ended = player.is_some_and(|p| p.ended);
+            let (icon, style) = if ended { ("rotate-ccw", IconStyle::weight(2.0)) } else { ("play", IconStyle::filled()) };
+            let px = crate::widgets::even_with(rad * 2.0, 32.0 * s);
+            // The triangle's mass sits left of its box; Photos nudges it right.
+            let nudge = if ended { 0.0 } else { (2.0 * s).round() };
+            out.icon_styled(icon, [(c.0 + nudge).round(), c.1.round()], px, rgb(hud.fg, progress), style);
             let label = if failed {
                 Some("Can't play this video".to_string())
             } else if playback.is_none() {
@@ -1344,7 +1348,7 @@ impl Viewer {
                     Text::new(label, c.0, c.1 + rad + 10.0 * s, 13.0 * s)
                         .weight(600)
                         .align(Align::Center)
-                        .color(fade_color(theme::text(), progress)),
+                        .color(fade_color(theme::text_rgba(theme::hud().fg, 0.92), progress)),
                 );
             }
             if !failed {
@@ -1364,19 +1368,23 @@ impl Viewer {
         let (bw, bh) = ((w - 32.0 * s).min(680.0 * s), 46.0 * s);
         let bar = [(w - bw) / 2.0, h - bh - 24.0 * s, bw, bh];
         let (x, cy) = (bar[0], bar[1] + bh / 2.0);
-        out.quad(Quad::solid(bar, rgb(0x1c1c1e, 0.82 * ca), bh / 2.0));
+        let hud = theme::hud();
+        out.quad(Quad::solid(bar, rgb(hud.glass, 0.84 * ca), bh / 2.0));
+        out.quad(Quad::solid(bar, rgb(0xffffff, 0.04 * ca), bh / 2.0));
         let text = |c: [u8; 4]| fade_color(c, ca);
-        let icon = |out: &mut Layer, cx: f32, glyph: &str, size: f32| {
-            out.text(Text::new(glyph, cx, cy - size * 0.625, size).icon().align(Align::Center).color(text(theme::text())));
+        let cursor = o.cursor;
+        let icon = |out: &mut Layer, cx: f32, name: &'static str, style: IconStyle, hit: [f32; 4]| {
+            let a = if contains(hit, cursor.0, cursor.1) { 1.0 } else { 0.88 };
+            out.icon_styled(name, [cx.round(), cy.round()], (18.0 * s).round(), rgb(hud.fg, a * ca), style);
         };
 
         let toggle = [x + 8.0 * s, cy - 17.0 * s, 34.0 * s, 34.0 * s];
-        let (glyph, nudge) = match () {
-            _ if p.is_playing() => ("\u{f04c}", 0.0),
-            _ if p.ended => ("\u{f01e}", 0.0),
-            _ => ("\u{f04b}", 1.5),
+        let (name, style, nudge) = match () {
+            _ if p.is_playing() => ("pause", IconStyle::filled(), 0.0),
+            _ if p.ended => ("rotate-ccw", IconStyle::weight(2.0), 0.0),
+            _ => ("play", IconStyle::filled(), (s).round()),
         };
-        icon(out, toggle[0] + toggle[2] / 2.0 + nudge * s, glyph, 17.0 * s);
+        icon(out, toggle[0] + toggle[2] / 2.0 + nudge, name, style, toggle);
 
         // Until the pipeline knows, the server's figure keeps the timeline from reading 0:00.
         let details = self.slots.get(&v.id).and_then(|s| s.info.as_ref()?.duration.as_ref());
@@ -1392,20 +1400,21 @@ impl Viewer {
         let (ew, rw) = (slot(r, &elapsed), slot(r, &remaining));
         let ty = cy - size * 0.625;
         let ex = x + 50.0 * s;
-        out.text(Text::new(elapsed, ex, ty, size).weight(600).color(text(theme::text_dim())));
+        let dim = theme::text_rgba(hud.fg_dim, 0.9);
+        out.text(Text::new(elapsed, ex, ty, size).weight(600).color(text(dim)));
 
         let vol_w = 64.0 * s;
         let vol = [x + bw - 18.0 * s - vol_w, bar[1], vol_w, bh];
         let mute_cx = vol[0] - 18.0 * s;
         let rx = mute_cx - 20.0 * s;
-        out.text(Text::new(remaining, rx, ty, size).weight(600).align(Align::Right).color(text(theme::text_dim())));
+        out.text(Text::new(remaining, rx, ty, size).weight(600).align(Align::Right).color(text(dim)));
         let track = [ex + ew + 12.0 * s, bar[1], (rx - rw - 12.0 * s) - (ex + ew + 12.0 * s), bh];
 
         let slider = |out: &mut Layer, t: [f32; 4], f: f32, knob: f32| {
             let th = 4.0 * s;
             let y = cy - th / 2.0;
-            out.quad(Quad::solid([t[0], y, t[2], th], rgb(0xffffff, 0.22 * ca), th / 2.0));
-            out.quad(Quad::solid([t[0], y, t[2] * f, th], rgb(0xffffff, 0.9 * ca), th / 2.0));
+            out.quad(Quad::solid([t[0], y, t[2], th], rgb(hud.fg, 0.22 * ca), th / 2.0));
+            out.quad(Quad::solid([t[0], y, t[2] * f, th], rgb(hud.fg, 0.9 * ca), th / 2.0));
             let k = knob * s;
             out.quad(Quad::solid([t[0] + t[2] * f - k / 2.0, cy - k / 2.0, k, k], rgb(0xffffff, ca), k / 2.0));
         };
@@ -1413,17 +1422,17 @@ impl Viewer {
         slider(out, track, f, if v.scrub.is_some() { 14.0 } else { 11.0 });
         let level = if self.muted { 0.0 } else { self.volume as f32 };
         slider(out, vol, level, 9.0);
-        let glyph = match level {
-            0.0 => "\u{f0581}",
-            l if l < 0.34 => "\u{f057f}",
-            l if l < 0.67 => "\u{f0580}",
-            _ => "\u{f057e}",
+        let name = match level {
+            0.0 => "volume-x",
+            l if l < 0.5 => "volume-1",
+            _ => "volume-2",
         };
-        icon(out, mute_cx, glyph, 17.0 * s);
+        let mute = [mute_cx - 14.0 * s, cy - 14.0 * s, 28.0 * s, 28.0 * s];
+        icon(out, mute_cx, name, IconStyle::weight(2.0), mute);
 
         o.hits.push((Hit::Toggle, toggle));
         o.hits.push((Hit::Scrub, track));
-        o.hits.push((Hit::Mute, [mute_cx - 14.0 * s, cy - 14.0 * s, 28.0 * s, 28.0 * s]));
+        o.hits.push((Hit::Mute, mute));
         o.hits.push((Hit::Volume, vol));
         o.hits.push((Hit::Bar, bar));
     }
@@ -1432,20 +1441,22 @@ impl Viewer {
     fn draw_live_pill(&self, o: &mut Open, ca: f32, s: f32, r: &mut Renderer, out: &mut Layer) {
         let size = 11.5 * s;
         let label_w = r.ui.measure("LIVE", size, 700, crate::ui::Font::Sans);
-        let (ph, icon) = (24.0 * s, 15.0 * s);
-        let pw = 9.0 * s + icon + 5.0 * s + label_w + 10.0 * s;
-        let x = (o.clip[0] + 12.0 * s).max(16.0 * s);
-        let y = (o.clip[1] + 12.0 * s).max(62.0 * s);
+        let ph = (24.0 * s).round();
+        let icon = crate::widgets::even_with(ph, 15.0 * s);
+        let pw = 8.0 * s + icon + 5.0 * s + label_w + 10.0 * s;
+        let x = (o.clip[0] + 12.0 * s).max(16.0 * s).round();
+        let y = (o.clip[1] + 12.0 * s).max(62.0 * s).round();
         let pill = [x, y, pw, ph];
         let playing = self.live.as_ref().is_some_and(|c| !c.stopped());
-        let bg = if playing { rgb(0xffffff, 0.30 * ca) } else { rgb(0x1c1c1e, 0.62 * ca) };
+        let hud = theme::hud();
+        let bg = if playing { rgb(0xffffff, 0.30 * ca) } else { rgb(hud.glass, 0.66 * ca) };
         out.quad(Quad::solid(pill, bg, ph / 2.0));
         let cy = y + ph / 2.0;
-        out.text(Text::new(hover::LIVE_GLYPH, x + 9.0 * s, cy - icon * 0.625, icon).icon().color(fade_color(theme::text(), ca)));
+        out.icon_styled("live-photo", [x + 8.0 * s + icon / 2.0, cy], icon, rgb(hud.fg, ca), IconStyle::weight(2.0));
         out.text(
-            Text::new("LIVE", x + 9.0 * s + icon + 5.0 * s, cy - size * 0.625, size)
+            Text::new("LIVE", x + 8.0 * s + icon + 5.0 * s, cy - size * 0.625, size)
                 .weight(700)
-                .color(fade_color(theme::text(), ca)),
+                .color(fade_color(theme::text_rgba(hud.fg, 1.0), ca)),
         );
         o.hits.push((Hit::Live, pill));
     }
@@ -1460,21 +1471,17 @@ impl Viewer {
             out.quad(Quad::solid([0.0, y, w, height / bands as f32 + 0.5], rgb(0x000000, 0.6 * (1.0 - t).powi(2) * ca), 0.0));
         }
 
-        let button = |out: &mut Layer, x: f32, icon: &str, on: bool| {
-            let d = 34.0 * s;
-            let rect = [x, 16.0 * s, d, d];
-            let bg = if on { rgb(theme::accent(), 0.9 * ca) } else { rgb(0xffffff, 0.14 * ca) };
-            out.quad(Quad::solid(rect, bg, d / 2.0));
-            out.text(
-                Text::new(icon, x + d / 2.0, rect[1] + d / 2.0 - 10.0 * s, 16.0 * s)
-                    .icon()
-                    .align(Align::Center)
-                    .color(fade_color(theme::text(), ca)),
-            );
-            rect
+        let (cursor, press) = (o.cursor, o.press.map(|p| p.0));
+        let button = |out: &mut Layer, x: f32, icon: &'static str, active: bool| {
+            let d = (ROUND * s).round();
+            let rect = [x.round(), (TOOLBAR_Y * s).round(), d, d];
+            let hovered = contains(rect, cursor.0, cursor.1);
+            let pressed = hovered && press.is_some_and(|p| contains(rect, p.0, p.1));
+            let st = State { hovered, pressed, active };
+            round_button(out, rect[0], rect[1], s, icon, IconStyle::weight(ICON_WEIGHT), None, st, ca)
         };
-        let close = button(out, 16.0 * s, "\u{f053}", false);
-        let info = button(out, w - 50.0 * s, "\u{f129}", o.panel);
+        let close = button(out, 16.0 * s, "chevron-left", false);
+        let info = button(out, w - 16.0 * s - (ROUND * s).round(), "info", o.panel);
         o.hits.push((Hit::Close, close));
         o.hits.push((Hit::Info, info));
 
@@ -1489,8 +1496,12 @@ impl Viewer {
         };
         let x = 64.0 * s;
         let max = (w - x - 80.0 * s - self.toolbar_width).max(50.0);
-        out.text(Text::new(title, x, 15.0 * s, 16.0 * s).weight(600).max_width(max).color(fade_color(theme::text(), ca)));
-        out.text(Text::new(subtitle, x, 36.0 * s, 13.0 * s).weight(500).max_width(max).color(fade_color(theme::text_dim(), ca)));
+        let hud = theme::hud();
+        // Two lines centred on the buttons' middle; one line sits on it.
+        let mid = (TOOLBAR_Y + ROUND / 2.0) * s;
+        let (ty, sy) = if subtitle.is_empty() { (mid - 10.0 * s, 0.0) } else { (mid - 19.0 * s, mid + 1.5 * s) };
+        out.text(Text::new(title, x, ty, 16.0 * s).weight(600).max_width(max).color(fade_color(theme::text_rgba(hud.fg, 1.0), ca)));
+        out.text(Text::new(subtitle, x, sy, 13.0 * s).weight(500).max_width(max).color(fade_color(theme::text_rgba(hud.fg_dim, 0.9), ca)));
     }
 
     fn draw_panel(&self, o: &mut Open, details: Option<&Details>, ca: f32, s: f32, r: &mut Renderer, out: &mut Layer) {
@@ -1552,7 +1563,8 @@ impl Viewer {
                 let cw = (inner - gap * (settings.len() as f32 - 1.0)) / settings.len() as f32;
                 for (k, v) in settings.into_iter().enumerate() {
                     let cx = x + pad + k as f32 * (cw + gap);
-                    out.quad(Quad::solid([cx, y, cw, 26.0 * s], rgb(0xffffff, 0.08 * ca), 7.0 * s));
+                    let p = theme::palette();
+                    out.quad(Quad::solid([cx, y, cw, 26.0 * s], rgb(p.shade(p.raised, 0.12), ca), 7.0 * s));
                     let size = if r.ui.measure(&v, 12.0 * s, 600, crate::ui::Font::Sans) > cw - 6.0 * s { 10.5 } else { 12.0 };
                     texts.push(
                         Text::new(v, cx + cw / 2.0, y + (26.0 - size * 1.25) / 2.0 * s, size * s)
@@ -1614,9 +1626,10 @@ fn finish_panel(
     hits: &mut Vec<(Hit, [f32; 4])>,
 ) {
     let rect = [x, top, w, bottom - top];
-    out.quad(Quad::solid(rect, rgb(0x1c1c1e, 0.94 * ca), 14.0 * s));
+    let p = theme::palette();
+    out.quad(Quad::solid(rect, rgb(p.raised, 0.96 * ca), 14.0 * s));
     for y in rules {
-        out.quad(Quad::solid([x + 18.0 * s, y, w - 36.0 * s, 1.0], rgb(theme::separator(), ca), 0.0));
+        out.quad(Quad::solid([x + 18.0 * s, y, w - 36.0 * s, s.round().max(1.0)], rgb(p.shade(p.raised, 0.12), ca), 0.0));
     }
     for t in texts {
         out.text(t);
@@ -1826,7 +1839,7 @@ fn spinner(out: &mut Layer, c: (f32, f32), rad: f32, alpha: f32, now: Instant) {
         let (x, y) = (c.0 + a.sin() * rad, c.1 - a.cos() * rad);
         let age = (step + 12 - k) % 12;
         let o = 1.0 - age as f32 / 12.0 * 0.85;
-        out.quad(Quad::solid([x - d / 2.0, y - d / 2.0, d, d], rgb(0xffffff, o * alpha), d / 2.0));
+        out.quad(Quad::solid([x - d / 2.0, y - d / 2.0, d, d], rgb(theme::hud().fg, o * alpha), d / 2.0));
     }
 }
 
