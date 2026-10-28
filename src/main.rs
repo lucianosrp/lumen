@@ -1,3 +1,4 @@
+mod gestures;
 mod grid;
 mod immich;
 mod library;
@@ -8,6 +9,7 @@ mod ui_render;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -306,7 +308,13 @@ struct App {
     cursor: (f32, f32),
     zoom_accum: f32,
     last_pixel_scroll: Option<(Instant, f32)>,
+    pinch: Option<Receiver<gestures::Pinch>>,
+    /// ln(scale) already turned into zoom steps during the current pinch.
+    pinch_applied: f64,
 }
+
+/// Finger-distance change (as a ratio) per grid zoom level.
+const PINCH_STEP: f64 = 1.3;
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -335,6 +343,18 @@ impl ApplicationHandler for App {
             let _ = proxy.send_event(());
         });
         let renderer = Renderer::new(device, queue, config.format);
+
+        use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        if let Ok(RawDisplayHandle::Wayland(h)) = window.display_handle().map(|h| h.as_raw()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let proxy = self.proxy.clone();
+            let wake = Arc::new(move || {
+                let _ = proxy.send_event(());
+            });
+            if gestures::start(h.display.as_ptr(), tx, wake) {
+                self.pinch = Some(rx);
+            }
+        }
         self.core = Some(Core::new(loader, renderer, (config.width, config.height), window.scale_factor() as f32));
         self.gpu = Some(Gpu { surface, config, instance });
         window.request_redraw();
@@ -342,6 +362,30 @@ impl ApplicationHandler for App {
     }
 
     fn user_event(&mut self, _: &ActiveEventLoop, _: ()) {
+        if let (Some(rx), Some(core)) = (&self.pinch, &mut self.core) {
+            let now = Instant::now();
+            let step = PINCH_STEP.ln();
+            while let Ok(p) = rx.try_recv() {
+                match p {
+                    gestures::Pinch::Begin => self.pinch_applied = 0.0,
+                    gestures::Pinch::Update { scale } if scale > 0.0 => {
+                        let l = scale.ln();
+                        let (ax, ay) = (self.cursor.0 - core.left, self.cursor.1);
+                        while l - self.pinch_applied > step {
+                            core.velocity = 0.0;
+                            core.layout.zoom(-1, ax, ay, now);
+                            self.pinch_applied += step;
+                        }
+                        while l - self.pinch_applied < -step {
+                            core.velocity = 0.0;
+                            core.layout.zoom(1, ax, ay, now);
+                            self.pinch_applied -= step;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -617,6 +661,8 @@ fn main() -> Result<()> {
         cursor: (0.0, 0.0),
         zoom_accum: 0.0,
         last_pixel_scroll: None,
+        pinch: None,
+        pinch_applied: 0.0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

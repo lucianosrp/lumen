@@ -15,10 +15,14 @@ glyphon = "0.12"
 image = { version = "0.25", default-features = false, features = ["webp", "jpeg", "png"] }
 log = "0.4.34"
 pollster = "1.0.1"
+raw-window-handle = "0.6"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thumbhash = "0.1.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "macros", "time", "fs"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wgpu = "30"
 winit = "0.30"
