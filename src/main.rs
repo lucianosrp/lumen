@@ -3,6 +3,7 @@ mod grid;
 mod immich;
 mod library;
 mod loader;
+mod map;
 mod render;
 mod sidebar;
 mod ui;
@@ -67,6 +68,8 @@ struct Core {
     /// What the grid is showing (the library, an album…).
     collection: Arc<Collection>,
     viewer: viewer::Viewer,
+    /// The Places map, shown instead of the grid while open.
+    map: Option<map::MapView>,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -97,6 +100,20 @@ impl Core {
             sidebar,
             collection: Arc::new(Collection::library()),
             viewer,
+            map: None,
+        }
+    }
+
+    fn toggle_map(&mut self) {
+        let open = self.map.is_none();
+        self.set_map(open);
+    }
+
+    fn set_map(&mut self, open: bool) {
+        match (self.map.take(), open) {
+            (Some(m), false) => m.close(&mut self.renderer),
+            (None, true) => self.map = Some(map::MapView::new(&self.loader, self.scale)),
+            (m, _) => self.map = m,
         }
     }
 
@@ -142,6 +159,21 @@ impl Core {
         let frame = self.frame;
         self.ui.clear();
         let sidebar_moving = sidebar::update(self, now);
+
+        // The map replaces the grid: no grid tiles drawn and no thumbnails requested.
+        if let Some(map) = &mut self.map {
+            self.instances.clear();
+            self.loader.set_wants(self.generation, []);
+            let area = [self.left, 0.0, self.size.0 as f32 - self.left, self.size.1 as f32];
+            let busy = map.update(now, &mut self.renderer, self.library.as_ref(), area, self.layout.vp.top, self.scale);
+            // Drawn after the sidebar, so move the map's quads underneath it.
+            let before = self.ui.base.quads.len();
+            map.draw(&mut self.ui);
+            let added = self.ui.base.quads.len() - before;
+            self.ui.base.quads.rotate_right(added);
+            self.build_header();
+            return busy || sidebar_moving;
+        }
 
         // Mouse wheels glide to their target; touchpads coast after the fingers lift.
         if self.smooth_scroll.abs() > 0.5 {
@@ -269,16 +301,28 @@ impl Core {
     /// Handles a sidebar click (or `--select`).
     fn apply(&mut self, action: sidebar::Action) {
         match action {
-            sidebar::Action::Open(c) => self.loader.open(c),
-            // Placeholder until the map view lands.
-            sidebar::Action::Places => log::info!("Places selected; no map view yet"),
+            sidebar::Action::Open(c) => {
+                self.set_map(false);
+                self.loader.open(c);
+            }
+            sidebar::Action::Places => self.set_map(true),
         }
+    }
+
+    /// A map pin was clicked: show its photos in the grid.
+    fn map_action(&mut self, action: map::Action) {
+        let map::Action::ShowAssets { title, ids } = action;
+        let key = format!("place:{title}:{}", ids.len());
+        self.sidebar.set_selected(&key);
+        self.set_map(false);
+        self.loader.open(Collection::ids(&key, &title, ids.into_iter().collect()));
     }
 
     /// Title, counts and sync status over the grid's top scrim.
     fn build_header(&mut self) {
         let library = self.collection.key == "library";
         let (title, subtitle) = match &self.library {
+            _ if self.map.is_some() => self.map.as_ref().unwrap().header(),
             None => ("Lumen".to_string(), String::new()),
             Some(lib) if lib.len() == 0 && library => ("Library".to_string(), "No photos yet".to_string()),
             Some(lib) if lib.len() == 0 => (self.collection.title.clone(), "No photos".to_string()),
@@ -369,6 +413,8 @@ struct App {
     pinch: Option<Receiver<gestures::Pinch>>,
     /// ln(scale) already turned into zoom steps during the current pinch.
     pinch_applied: f64,
+    /// Cumulative scale at the previous pinch update, for continuous zooms.
+    pinch_last: f64,
     /// Where the left button went down, to tell clicks from drags.
     press: Option<(f32, f32)>,
 }
@@ -427,7 +473,20 @@ impl ApplicationHandler for App {
             let step = PINCH_STEP.ln();
             while let Ok(p) = rx.try_recv() {
                 match p {
-                    gestures::Pinch::Begin => self.pinch_applied = 0.0,
+                    gestures::Pinch::Begin => (self.pinch_applied, self.pinch_last) = (0.0, 1.0),
+                    // The viewer and the map zoom continuously, following the fingers.
+                    gestures::Pinch::Update { scale } if scale > 0.0 && (core.viewer.is_open() || core.map.is_some()) => {
+                        let ratio = scale / self.pinch_last;
+                        self.pinch_last = scale;
+                        if core.viewer.is_open() {
+                            core.viewer.pinch(ratio as f32, self.cursor);
+                        } else if let Some(map) = &mut core.map {
+                            // SAFETY: dummy ids are meant for synthesized events like this one.
+                            let device_id = unsafe { winit::event::DeviceId::dummy() };
+                            let ev = WindowEvent::PinchGesture { device_id, delta: ratio - 1.0, phase: TouchPhase::Moved };
+                            map.event(&ev, self.modifiers, now);
+                        }
+                    }
                     gestures::Pinch::Update { scale } if scale > 0.0 => {
                         let l = scale.ln();
                         let (ax, ay) = (self.cursor.0 - core.left, self.cursor.1);
@@ -459,6 +518,18 @@ impl ApplicationHandler for App {
         if core.viewer.is_open() && core.viewer.input(&event, self.modifiers, now) {
             window.request_redraw();
             return;
+        }
+        // The map owns its area while open; the sidebar keeps its own clicks and scrolling.
+        let over_sidebar = core.sidebar.contains(self.cursor, scale);
+        if let (Some(map), false) = (&mut core.map, over_sidebar) {
+            match map.event(&event, self.modifiers, now) {
+                map::Response::Ignored => {}
+                map::Response::Handled => return window.request_redraw(),
+                map::Response::Action(a) => {
+                    core.map_action(a);
+                    return window.request_redraw();
+                }
+            }
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -565,6 +636,13 @@ impl ApplicationHandler for App {
                     }
                     Key::Character("q") if self.modifiers.control_key() => event_loop.exit(),
                     Key::Character("b") if self.modifiers.control_key() => core.sidebar.toggle(),
+                    Key::Character("m") => {
+                        core.toggle_map();
+                        core.sidebar.set_selected(if core.map.is_some() { "places" } else { "library" });
+                        if core.map.is_none() {
+                            core.loader.open(Collection::library());
+                        }
+                    }
                     _ => {}
                 }
                 window.request_redraw();
@@ -637,6 +715,7 @@ struct Shot {
     select: Option<String>,
     sidebar: bool,
     viewer: Option<viewer::Shot>,
+    map: Option<map::Shot>,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -662,7 +741,8 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
                 && core.loader.is_idle()
                 && core.sidebar.is_idle()
                 && core.status.is_empty()
-                && !core.viewer.loading();
+                && !core.viewer.loading()
+                && core.map.as_ref().is_none_or(|m| m.is_idle());
             quiet = if done { quiet + 1 } else { 0 };
         }
         Ok(())
@@ -675,7 +755,27 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
         settle(&mut core)?;
     }
     let (cx, cy) = (core.layout.vp.width / 2.0, size.1 as f32 / 2.0);
-    if shot.fit {
+    if let Some(shot) = &shot.map {
+        core.toggle_map();
+        let map = core.map.as_mut().unwrap();
+        if let Some((lat, lon, z)) = shot.at {
+            map.set_view(lat, lon, z);
+        }
+        settle(&mut core)?;
+        let map = core.map.as_mut().unwrap();
+        if let Some([x, y]) = shot.hover {
+            map.hover(x, y);
+        }
+        if let Some([x, y]) = shot.click {
+            let action = map.click(x, y);
+            println!("map click at {x},{y}: {action:?}");
+            if let Some(a) = action {
+                core.map_action(a);
+                settle(&mut core)?;
+            }
+        }
+    } else if shot.fit {
+
         core.layout.zoom_to(core.layout.levels() - 1, cx, cy, Instant::now());
     } else if shot.zoom != 0 {
         core.layout.zoom(shot.zoom, cx, cy, Instant::now());
@@ -799,6 +899,7 @@ fn main() -> Result<()> {
                 zoom: flag("--viewer-zoom").and_then(|s| s.parse().ok()),
                 close_at: flag("--close-at").and_then(|s| s.parse().ok()),
             }),
+            map: map::Shot::parse(&args),
         };
         return screenshot(source, &path, size, scale, shot);
     }
@@ -816,6 +917,7 @@ fn main() -> Result<()> {
         last_pixel_scroll: None,
         pinch: None,
         pinch_applied: 0.0,
+        pinch_last: 1.0,
         press: None,
     };
     event_loop.run_app(&mut app)?;

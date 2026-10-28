@@ -199,6 +199,11 @@ impl Sidebar {
 
     /// Selects a row the way a click would, for headless testing: "library", "favorites",
     /// "videos", "places", "people", "archive", "trash", "album:<name>" or "person:<name>".
+    /// Highlights a row by key; keys that match no row clear the highlight.
+    pub fn set_selected(&mut self, key: &str) {
+        self.selected = key.to_string();
+    }
+
     pub fn select(&mut self, spec: &str, height: f32, scale: f32) -> Result<Option<Action>> {
         let (kind, name) = spec.split_once(':').unwrap_or((spec, ""));
         let name = name.to_lowercase();

@@ -265,6 +265,13 @@ impl Viewer {
         }
     }
 
+    /// Touchpad pinch: zooms by `factor` around `at` (physical px).
+    pub fn pinch(&mut self, factor: f32, at: (f32, f32)) {
+        if let Some(o) = &mut self.open {
+            o.zoom_by(factor, at);
+        }
+    }
+
     /// Headless: zooms by `factor` around the centre.
     pub fn zoom(&mut self, factor: f32) {
         if let Some(o) = &mut self.open {
