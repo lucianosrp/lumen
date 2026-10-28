@@ -206,7 +206,11 @@ impl Core {
         for r in self.layout.visible(&target, margin) {
             for i in r {
                 let rect = target.rect(i, &vp);
-                let Some(tier) = tier_for(rect[2]) else { continue };
+                let Some(mut tier) = tier_for(rect[2]) else { continue };
+                // Mid-pinch sizes are transient; fetch big previews once the fingers lift.
+                if tier == Tier::Xl && self.layout.pinching() {
+                    tier = Tier::Large;
+                }
                 let outside = rect[1] + rect[3] < 0.0 || rect[1] > vp.height;
                 // Previews are big downloads: only for what's actually on screen.
                 if tier == Tier::Xl && outside {
@@ -282,7 +286,8 @@ impl Core {
         // Uploads last, so eviction never takes a slot touched this frame.
         let start = Instant::now();
         while let Some(t) = self.pending.front() {
-            if start.elapsed() > Duration::from_millis(5) {
+            let budget = if self.layout.pinching() { 2 } else { 5 };
+            if start.elapsed() > Duration::from_millis(budget) {
                 break;
             }
             if !self.renderer.upload_thumb(t.index, t.tier, &t.mips, frame, now) {

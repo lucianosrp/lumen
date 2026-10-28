@@ -121,7 +121,10 @@ pub struct Layout {
     pub vp: Viewport,
     pub n: usize,
     pub target: Grid,
-    from: Option<(Spec, Instant)>,
+    /// Frozen on-screen state being blended away from, when it started, and how long it takes.
+    from: Option<(Spec, Instant, Duration)>,
+    /// Pinch scale when `from` was frozen mid-pinch, so the old layout keeps following the fingers.
+    from_scale: Option<f32>,
     levels: Vec<u32>,
     pub level: usize,
     /// Active touchpad pinch: anchor (grid-local px) and scale relative to `target`.
@@ -129,6 +132,8 @@ pub struct Layout {
 }
 
 const ZOOM_TIME: Duration = Duration::from_millis(340);
+/// Reflows during a pinch are quicker: the fingers are already driving the motion.
+const PINCH_REFLOW_TIME: Duration = Duration::from_millis(180);
 const LEVELS: [u32; 18] = [1, 3, 5, 7, 9, 13, 19, 27, 39, 55, 79, 113, 161, 229, 325, 461, 655, 931];
 
 fn ease(t: f32) -> f32 {
@@ -138,7 +143,7 @@ fn ease(t: f32) -> f32 {
 
 impl Layout {
     pub fn new(vp: Viewport) -> Self {
-        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0 }, from: None, levels: vec![5], level: 0, pinch: None }
+        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0 }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None }
     }
 
     /// Columns at which the whole library fits on one screen.
@@ -230,7 +235,11 @@ impl Layout {
         }
         let current = self.current(now);
         self.set_level(level, ax, ay);
-        self.from = Some((current.prune(3), now));
+        self.freeze(current, now, ZOOM_TIME);
+    }
+
+    pub fn pinching(&self) -> bool {
+        self.pinch.is_some()
     }
 
     pub fn pinch_begin(&mut self, ax: f32, ay: f32) {
@@ -253,7 +262,13 @@ impl Layout {
             self.reflow(self.level + 1, ax, ay, s, now);
         }
         // Rubber-band past the first and last levels.
-        self.pinch = Some(([ax, ay], s.clamp(0.8, 1.4)));
+        if self.level == 0 {
+            s = s.min(1.4);
+        }
+        if self.level + 1 == self.levels.len() {
+            s = s.max(0.8);
+        }
+        self.pinch = Some(([ax, ay], s));
     }
 
     /// Fingers lifted: settle on whichever level is nearest.
@@ -272,7 +287,12 @@ impl Layout {
         if level != self.level {
             self.set_level(level, ax, ay);
         }
-        self.from = Some((current.prune(3), now));
+        self.freeze(current, now, ZOOM_TIME);
+    }
+
+    fn freeze(&mut self, current: Spec, now: Instant, duration: Duration) {
+        self.from = Some((current.prune(3), now, duration));
+        self.from_scale = None;
     }
 
     /// Size ratio between `level` and the next, more zoomed-out level.
@@ -285,7 +305,8 @@ impl Layout {
         let current = self.current(now);
         self.set_level(level, ax, ay);
         self.pinch = Some(([ax, ay], s));
-        self.from = Some((current.prune(3), now));
+        self.freeze(current, now, PINCH_REFLOW_TIME);
+        self.from_scale = Some(s);
     }
 
     /// Switches column count keeping the tile under (ax, ay) in place.
@@ -305,7 +326,7 @@ impl Layout {
         self.target.scroll += dy;
         self.target.clamp(self.n, &self.vp);
         let applied = self.target.scroll - before;
-        if let Some((from, _)) = &mut self.from {
+        if let Some((from, _, _)) = &mut self.from {
             from.scroll_by(applied);
         }
     }
@@ -320,7 +341,7 @@ impl Layout {
     }
 
     fn blending(&self, now: Instant) -> bool {
-        self.from.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < ZOOM_TIME)
+        self.from.as_ref().is_some_and(|(_, t, d)| now.duration_since(*t) < *d)
     }
 
     /// What's on screen right now.
@@ -330,9 +351,13 @@ impl Layout {
             None => Spec::Grid(self.target),
         };
         match &self.from {
-            Some((from, start)) if self.blending(now) => {
-                let t = ease(now.duration_since(*start).as_secs_f32() / ZOOM_TIME.as_secs_f32());
-                Spec::Blend(Box::new(from.clone()), Box::new(target), t)
+            Some((from, start, d)) if self.blending(now) => {
+                let t = ease(now.duration_since(*start).as_secs_f32() / d.as_secs_f32());
+                let from = match (self.pinch, self.from_scale) {
+                    (Some((anchor, s)), Some(s0)) => Spec::Scaled(Box::new(from.clone()), anchor, s / s0),
+                    _ => from.clone(),
+                };
+                Spec::Blend(Box::new(from), Box::new(target), t)
             }
             _ => target,
         }
