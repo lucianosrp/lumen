@@ -3,6 +3,8 @@ struct Globals {
     th: vec4f,     // cell px, cells per row, atlas width, atlas height
     small: vec4f,  // slot px, slots per row, atlas size, mip count
     large: vec4f,
+    xl: vec4f,
+    xl_size: vec4f, // atlas width, height
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -10,6 +12,7 @@ struct Globals {
 @group(0) @binding(2) var th_tex: texture_2d<f32>;
 @group(0) @binding(3) var small_tex: texture_2d<f32>;
 @group(0) @binding(4) var large_tex: texture_2d<f32>;
+@group(0) @binding(5) var xl_tex: texture_2d<f32>;
 
 struct Tile {
     @location(0) rect: vec4f,
@@ -60,9 +63,11 @@ fn cell_sample(tex: texture_2d<f32>, index: u32, info: vec4f, tex_size: vec2f, m
 fn fs_tile(v: VOut) -> @location(0) vec4f {
     var c = cell_sample(th_tex, v.th, g.th, g.th.zw, log2(g.th.x) + 1.0, v.uv, v.size);
     if v.slot != 0xffffffffu {
-        let s = v.slot & 0x7fffffffu;
+        let s = v.slot & 0x3fffffffu;
         var img: vec4f;
-        if (v.slot & 0x80000000u) != 0u {
+        if (v.slot & 0x40000000u) != 0u {
+            img = cell_sample(xl_tex, s, g.xl, g.xl_size.xy, g.xl.w, v.uv, v.size);
+        } else if (v.slot & 0x80000000u) != 0u {
             img = cell_sample(large_tex, s, g.large, vec2f(g.large.z), g.large.w, v.uv, v.size);
         } else {
             img = cell_sample(small_tex, s, g.small, vec2f(g.small.z), g.small.w, v.uv, v.size);

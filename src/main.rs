@@ -23,13 +23,15 @@ use winit::window::{Fullscreen, Theme, Window, WindowId};
 use grid::{Layout, Viewport};
 use library::Library;
 use loader::{Collection, Loader, Msg, Source, Thumb, Tier, group};
-use render::{Instance, LARGE_BIT, NO_SLOT, Renderer};
+use render::{Instance, LARGE_BIT, NO_SLOT, Renderer, XL_BIT};
 use ui::{Text, theme};
 
 /// Tiles below this many physical pixels show only their thumbhash.
 const SMALL_MIN: f32 = 18.0;
 /// Tiles at or above this size get the 256px thumbnail instead of the 64px one.
 const LARGE_MIN: f32 = 88.0;
+/// Tiles at or above this size get the server's ~1440px preview.
+const XL_MIN: f32 = 400.0;
 const FADE: f32 = 0.22;
 /// Touchpad pixels → screen pixels.
 const TOUCHPAD_SPEED: f32 = 2.5;
@@ -169,29 +171,38 @@ impl Core {
             for i in r {
                 let rect = target.rect(i, &vp);
                 let Some(tier) = tier_for(rect[2]) else { continue };
+                let outside = rect[1] + rect[3] < 0.0 || rect[1] > vp.height;
+                // Previews are big downloads: only for what's actually on screen.
+                if tier == Tier::Xl && outside {
+                    continue;
+                }
+                // While a preview downloads, the cached thumbnail stands in for it.
+                if tier == Tier::Xl && self.renderer.large.get(i).is_none() {
+                    wants.push((-1.0, (i, Tier::Large)));
+                }
                 let atlas = match tier {
                     Tier::Small => &mut self.renderer.small,
                     Tier::Large => &mut self.renderer.large,
+                    Tier::Xl => &mut self.renderer.xl,
                 };
                 match atlas.get(i) {
                     Some(slot) => atlas.touch(slot, frame),
                     None => {
                         let (dx, dy) = (rect[0] + rect[2] / 2.0 - vp.width / 2.0, rect[1] + rect[3] / 2.0 - vp.height / 2.0);
-                        let outside = rect[1] + rect[3] < 0.0 || rect[1] > vp.height;
                         wants.push((dx * dx + dy * dy + if outside { 1e12 } else { 0.0 }, (i, tier)));
                     }
                 }
             }
         }
         wants.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let (small_cap, large_cap) = (self.renderer.small.capacity() * 3 / 4, self.renderer.large.capacity() * 3 / 4);
-        let (mut ns, mut nl) = (0, 0);
+        let caps = [&self.renderer.small, &self.renderer.large, &self.renderer.xl].map(|a| a.capacity() * 3 / 4);
+        let mut counts = [0; 3];
         self.loader.set_wants(
             self.generation,
             wants.into_iter().map(|w| w.1).filter(|&(_, t)| {
-                let (n, cap) = if t == Tier::Small { (&mut ns, small_cap) } else { (&mut nl, large_cap) };
-                *n += 1;
-                *n <= cap
+                let k = t as usize;
+                counts[k] += 1;
+                counts[k] <= caps[k]
             }),
         );
 
@@ -207,15 +218,23 @@ impl Core {
                 }
                 let size = rect[2];
                 let (mut slot, mut loaded) = (NO_SLOT, None);
-                let large = (size >= LARGE_MIN * 0.75).then(|| self.renderer.large.get(i)).flatten();
-                if let Some(s) = large {
-                    self.renderer.large.touch(s, frame);
-                    (slot, loaded) = (s | LARGE_BIT, Some(self.renderer.large.loaded_at(s)));
-                } else if let Some(s) = self.renderer.small.get(i) {
-                    self.renderer.small.touch(s, frame);
-                    (slot, loaded) = (s, Some(self.renderer.small.loaded_at(s)));
+                let r = &mut self.renderer;
+                let xl = (size >= XL_MIN * 0.75).then(|| r.xl.get(i)).flatten();
+                let large = (size >= LARGE_MIN * 0.75).then(|| r.large.get(i)).flatten();
+                let small = r.small.get(i);
+                if let Some(s) = xl {
+                    r.xl.touch(s, frame);
+                    (slot, loaded) = (s | XL_BIT, Some(r.xl.loaded_at(s)));
+                } else if let Some(s) = large {
+                    r.large.touch(s, frame);
+                    (slot, loaded) = (s | LARGE_BIT, Some(r.large.loaded_at(s)));
+                } else if let Some(s) = small {
+                    r.small.touch(s, frame);
+                    (slot, loaded) = (s, Some(r.small.loaded_at(s)));
                 }
-                let fade = loaded.map_or(0.0, |t| (now.duration_since(t).as_secs_f32() / FADE).min(1.0));
+                // Only fade in from the blurry placeholder; a sharper tier just replaces a lower one.
+                let upgrade = (xl.is_some() && (large.is_some() || small.is_some())) || (xl.is_none() && large.is_some() && small.is_some());
+                let fade = if upgrade { 1.0 } else { loaded.map_or(0.0, |t| (now.duration_since(t).as_secs_f32() / FADE).min(1.0)) };
                 fading |= fade < 1.0 && slot != NO_SLOT;
                 // Hairline gaps when tiles are big enough to read as photos; a seamless mosaic below.
                 let gap = if size < 40.0 * self.scale { 0.0 } else { (size * 0.012).clamp(1.0, 2.0 * self.scale) };
@@ -306,7 +325,9 @@ impl Core {
 }
 
 fn tier_for(size: f32) -> Option<Tier> {
-    if size >= LARGE_MIN {
+    if size >= XL_MIN {
+        Some(Tier::Xl)
+    } else if size >= LARGE_MIN {
         Some(Tier::Large)
     } else if size >= SMALL_MIN {
         Some(Tier::Small)

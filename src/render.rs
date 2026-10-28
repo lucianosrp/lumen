@@ -8,6 +8,7 @@ use crate::loader::Tier;
 
 pub const NO_SLOT: u32 = u32::MAX;
 pub const LARGE_BIT: u32 = 0x8000_0000;
+pub const XL_BIT: u32 = 0x4000_0000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -26,6 +27,8 @@ struct Globals {
     th: [f32; 4],
     small: [f32; 4],
     large: [f32; 4],
+    xl: [f32; 4],
+    xl_size: [f32; 4],
 }
 
 const ATLAS: u32 = 8192;
@@ -48,7 +51,7 @@ impl SlotAtlas {
     fn new(device: &wgpu::Device, tier: Tier) -> Self {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("slot atlas"),
-            size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: ATLAS, height: tier.atlas_height(), depth_or_array_layers: 1 },
             mip_level_count: Tier::MIPS,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -57,7 +60,7 @@ impl SlotAtlas {
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
-        let cap = (ATLAS / tier.slot()).pow(2) as usize;
+        let cap = ((ATLAS / tier.slot()) * (tier.atlas_height() / tier.slot())) as usize;
         Self {
             tex,
             view,
@@ -162,6 +165,7 @@ pub struct Renderer {
     th_info: [f32; 4],
     pub small: SlotAtlas,
     pub large: SlotAtlas,
+    pub xl: SlotAtlas,
     instances: wgpu::Buffer,
     instance_count: u32,
     pub ui: UiRenderer,
@@ -202,6 +206,7 @@ impl Renderer {
                 tex_entry(2),
                 tex_entry(3),
                 tex_entry(4),
+                tex_entry(5),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -269,6 +274,7 @@ impl Renderer {
         Self {
             small: SlotAtlas::new(&device, Tier::Small),
             large: SlotAtlas::new(&device, Tier::Large),
+            xl: SlotAtlas::new(&device, Tier::Xl),
             device,
             queue,
             tile_pipeline,
@@ -324,6 +330,7 @@ impl Renderer {
         self.th_view = Some(tex.create_view(&Default::default()));
         self.small.reset(lib.len());
         self.large.reset(lib.len());
+        self.xl.reset(lib.len());
         self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
@@ -336,6 +343,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.small.view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.large.view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.xl.view) },
             ],
         }));
     }
@@ -345,6 +353,7 @@ impl Renderer {
         let atlas = match tier {
             Tier::Small => &mut self.small,
             Tier::Large => &mut self.large,
+            Tier::Xl => &mut self.xl,
         };
         if index >= atlas.slot_of.len() || atlas.get(index).is_some() {
             return true;
@@ -370,6 +379,8 @@ impl Renderer {
             th: self.th_info,
             small: self.small.globals(),
             large: self.large.globals(),
+            xl: self.xl.globals(),
+            xl_size: [ATLAS as f32, Tier::Xl.atlas_height() as f32, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
         let bytes = std::mem::size_of_val(tiles) as u64;

@@ -19,6 +19,8 @@ use crate::library::{self, Asset, Library};
 pub enum Tier {
     Small,
     Large,
+    /// Server preview (~1440px), for the closest grid zoom. Not disk-cached.
+    Xl,
 }
 
 impl Tier {
@@ -26,6 +28,14 @@ impl Tier {
         match self {
             Tier::Small => 64,
             Tier::Large => 256,
+            Tier::Xl => 1024,
+        }
+    }
+    /// Atlas height; the XL atlas only needs a handful of on-screen tiles.
+    pub const fn atlas_height(self) -> u32 {
+        match self {
+            Tier::Xl => 4096,
+            _ => 8192,
         }
     }
     pub const MIPS: u32 = 4;
@@ -360,10 +370,13 @@ async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) ->
         Source::Demo(_) => {
             // Pretend there's a network in between.
             tokio::time::sleep(Duration::from_millis(5 + (index % 7) as u64 * 6)).await;
-            image::DynamicImage::ImageRgba8(library::demo_image(index as u64, 256))
+            image::DynamicImage::ImageRgba8(library::demo_image(index as u64, tier.slot()))
         }
         Source::Immich(immich) => {
-            let bytes = thumbnail_bytes(immich, &asset.id).await?;
+            let bytes = match tier {
+                Tier::Xl => immich.get_bytes(&format!("/assets/{}/thumbnail?size=preview", asset.id)).await?,
+                _ => thumbnail_bytes(immich, &asset.id).await?,
+            };
             tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??
         }
     };
