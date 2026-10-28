@@ -3,11 +3,11 @@
 //! The UI thread publishes a priority-ordered want list every frame; workers pop from its
 //! front, so anything that scrolled out of view is simply never fetched.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use image::imageops::FilterType;
@@ -42,7 +42,7 @@ pub struct Thumb {
 }
 
 pub enum Msg {
-    Library { library: Arc<Library>, generation: u64 },
+    Library { library: Arc<Library>, generation: u64, collection: Arc<Collection> },
     Status(String),
     Thumb(Thumb),
 }
@@ -53,8 +53,72 @@ pub enum Source {
     Immich(Immich),
 }
 
+/// Which assets a collection shows on top of what its query returns.
+#[derive(Clone, Debug)]
+pub enum Filter {
+    All,
+    VideosOnly,
+    Ids(Arc<HashSet<String>>),
+}
+
+/// A filtered timeline the grid can show: the library, an album, a person…
+#[derive(Clone, Debug)]
+pub struct Collection {
+    /// Stable identity, e.g. "library", "favorites", "album:<id>".
+    pub key: String,
+    pub title: String,
+    /// Query string for the `/timeline/bucket(s)` endpoints.
+    pub query: String,
+    pub filter: Filter,
+}
+
+const LIBRARY_QUERY: &str = "visibility=timeline";
+
+impl Collection {
+    fn new(key: impl Into<String>, title: impl Into<String>, query: impl Into<String>, filter: Filter) -> Self {
+        Self { key: key.into(), title: title.into(), query: query.into(), filter }
+    }
+    pub fn library() -> Self {
+        Self::new("library", "Library", LIBRARY_QUERY, Filter::All)
+    }
+    pub fn favorites() -> Self {
+        Self::new("favorites", "Favorites", "visibility=timeline&isFavorite=true", Filter::All)
+    }
+    pub fn videos() -> Self {
+        Self::new("videos", "Videos", LIBRARY_QUERY, Filter::VideosOnly)
+    }
+    pub fn archive() -> Self {
+        Self::new("archive", "Archive", "visibility=archive", Filter::All)
+    }
+    pub fn trash() -> Self {
+        Self::new("trash", "Recently Deleted", "isTrashed=true", Filter::All)
+    }
+    pub fn album(id: &str, name: &str) -> Self {
+        Self::new(format!("album:{id}"), name, format!("albumId={id}"), Filter::All)
+    }
+    pub fn person(id: &str, name: &str) -> Self {
+        Self::new(format!("person:{id}"), name, format!("personId={id}"), Filter::All)
+    }
+    /// A hand-picked set of Library assets (e.g. everything inside a map region).
+    #[allow(dead_code)]
+    pub fn ids(key: &str, title: &str, ids: HashSet<String>) -> Self {
+        Self::new(key, title, LIBRARY_QUERY, Filter::Ids(Arc::new(ids)))
+    }
+
+    fn apply(&self, assets: &[Asset]) -> Vec<Asset> {
+        match &self.filter {
+            Filter::All => assets.to_vec(),
+            Filter::VideosOnly => assets.iter().filter(|a| a.video).cloned().collect(),
+            Filter::Ids(ids) => assets.iter().filter(|a| ids.contains(&a.id)).cloned().collect(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Queue {
+    /// Bumped by every `open`; a sync only publishes while it is still the latest request.
+    request: u64,
+    syncing: bool,
     generation: u64,
     library: Option<Arc<Library>>,
     want: VecDeque<Job>,
@@ -64,6 +128,8 @@ struct Queue {
 
 struct Shared {
     queue: Mutex<Queue>,
+    /// Timelines synced this session, by query, so filtered views and quick revisits skip the network.
+    fresh: Mutex<HashMap<String, (Instant, Arc<Vec<Asset>>)>>,
     tx: Mutex<Sender<Msg>>,
     wake: Box<dyn Fn() + Send + Sync>,
 }
@@ -80,25 +146,44 @@ pub struct Loader {
     shared: Arc<Shared>,
     rt: tokio::runtime::Runtime,
     source: Source,
+    sync: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 const WORKERS: usize = 24;
+/// How long a synced timeline is reused before `open` asks the server again.
+const FRESH_FOR: Duration = Duration::from_secs(120);
 
 impl Loader {
     pub fn start(source: Source, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let (tx, rx) = channel();
         let shared = Arc::new(Shared {
             queue: Mutex::default(),
+            fresh: Mutex::default(),
             tx: Mutex::new(tx),
             wake: Box::new(wake),
         });
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        rt.spawn(sync_library(source.clone(), shared.clone()));
         for _ in 0..WORKERS {
             rt.spawn(worker(source.clone(), shared.clone()));
         }
-        let source = source.clone();
-        Self { rx, shared, rt, source }
+        let loader = Self { rx, shared, rt, source, sync: Mutex::new(None) };
+        loader.open(Collection::library());
+        loader
+    }
+
+    /// Switches the grid to `collection`: cached version first, then a refresh. Supersedes
+    /// any sync still running for an earlier `open`.
+    pub fn open(&self, collection: Collection) {
+        let request = {
+            let mut q = self.shared.queue.lock().unwrap();
+            q.request += 1;
+            q.syncing = true;
+            q.request
+        };
+        let task = self.rt.spawn(sync(self.source.clone(), self.shared.clone(), Arc::new(collection), request));
+        if let Some(old) = self.sync.lock().unwrap().replace(task.abort_handle()) {
+            old.abort();
+        }
     }
 
     pub fn source(&self) -> &Source {
@@ -134,7 +219,7 @@ impl Loader {
 
     pub fn is_idle(&self) -> bool {
         let q = self.shared.queue.lock().unwrap();
-        q.want.is_empty() && q.inflight.is_empty()
+        q.want.is_empty() && q.inflight.is_empty() && !q.syncing
     }
 }
 
@@ -142,61 +227,99 @@ pub fn cache_dir() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("lumen")
 }
 
-async fn sync_library(source: Source, shared: Arc<Shared>) {
-    let publish = |assets: Vec<Asset>| {
-        let shared = shared.clone();
-        async move {
-            let library = Arc::new(tokio::task::spawn_blocking(move || Library::new(assets)).await.unwrap());
-            let generation = {
-                let mut q = shared.queue.lock().unwrap();
-                q.generation += 1;
-                q.library = Some(library.clone());
-                q.want.clear();
-                q.failed.clear();
-                q.generation
-            };
-            shared.send(Msg::Library { library, generation });
-        }
-    };
+impl Shared {
+    fn current(&self, request: u64) -> bool {
+        self.queue.lock().unwrap().request == request
+    }
 
-    match source {
-        Source::Demo(n) => {
-            shared.send(Msg::Status(format!("Generating {n} demo photos…")));
-            let assets = tokio::task::spawn_blocking(move || library::demo_assets(n)).await.unwrap();
-            publish(assets).await;
+    fn status(&self, request: u64, s: String) {
+        if self.current(request) {
+            self.send(Msg::Status(s));
+        }
+    }
+}
+
+async fn publish(shared: &Arc<Shared>, collection: &Arc<Collection>, request: u64, assets: Arc<Vec<Asset>>) {
+    let c = collection.clone();
+    let library = Arc::new(tokio::task::spawn_blocking(move || Library::new(c.apply(&assets))).await.unwrap());
+    let generation = {
+        let mut q = shared.queue.lock().unwrap();
+        if q.request != request {
+            return;
+        }
+        q.generation += 1;
+        q.library = Some(library.clone());
+        q.want.clear();
+        q.failed.clear();
+        q.generation
+    };
+    shared.send(Msg::Library { library, generation, collection: collection.clone() });
+}
+
+async fn sync(source: Source, shared: Arc<Shared>, collection: Arc<Collection>, request: u64) {
+    let query = collection.query.clone();
+    let fresh = shared.fresh.lock().unwrap().get(&query).filter(|(t, _)| t.elapsed() < FRESH_FOR).map(|f| f.1.clone());
+    let mut ok = true;
+    if let Some(assets) = fresh {
+        publish(&shared, &collection, request, assets).await;
+    } else {
+        match &source {
+            Source::Demo(n) => {
+                let n = if query == LIBRARY_QUERY { *n } else { 0 };
+                shared.status(request, format!("Generating {n} demo photos…"));
+                let assets = Arc::new(tokio::task::spawn_blocking(move || library::demo_assets(n)).await.unwrap());
+                shared.fresh.lock().unwrap().insert(query, (Instant::now(), assets.clone()));
+                publish(&shared, &collection, request, assets).await;
+            }
+            Source::Immich(immich) => ok = sync_immich(immich, &shared, &collection, request).await,
+        }
+    }
+    let mut q = shared.queue.lock().unwrap();
+    if q.request == request {
+        q.syncing = false;
+        drop(q);
+        if ok {
             shared.send(Msg::Status(String::new()));
         }
-        Source::Immich(immich) => {
-            // Show the last known library instantly, then refresh from the server.
-            let key = format!("{:016x}", fxhash(immich.base()));
-            let path = cache_dir().join(format!("library-{key}.json"));
-            let cached: Option<Vec<Asset>> =
-                std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
-            if let Some(assets) = cached.clone() {
-                publish(assets).await;
-            } else {
-                shared.send(Msg::Status(format!("Connecting to {}…", immich.base())));
+    }
+}
+
+/// Returns false if the refresh failed (the error stays in the status line).
+async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Collection>, request: u64) -> bool {
+    // Show the last known version instantly, then refresh from the server.
+    let query = &collection.query;
+    let key = format!("{:016x}", fxhash(immich.base()));
+    let name = if query == LIBRARY_QUERY { format!("library-{key}.json") } else { format!("library-{key}-{:016x}.json", fxhash(query)) };
+    let path = cache_dir().join(name);
+    let cached: Option<Arc<Vec<Asset>>> =
+        std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(Arc::new);
+    if let Some(assets) = cached.clone() {
+        publish(shared, collection, request, assets).await;
+    } else if query == LIBRARY_QUERY {
+        shared.status(request, format!("Connecting to {}…", immich.base()));
+    } else {
+        shared.status(request, format!("Loading {}…", collection.title));
+    }
+    let s = shared.clone();
+    let progress = move |done: usize, total: usize| {
+        s.status(request, format!("Syncing {} of {} photos…", group(done), group(total)))
+    };
+    match immich.timeline(query, progress).await {
+        Ok(mut assets) => {
+            assets.sort_by(|a, b| a.taken.cmp(&b.taken));
+            let assets = Arc::new(assets);
+            shared.fresh.lock().unwrap().insert(query.clone(), (Instant::now(), assets.clone()));
+            if cached.as_ref().is_none_or(|c| *c != assets) {
+                let _ = std::fs::create_dir_all(cache_dir());
+                let _ = std::fs::write(&path, serde_json::to_vec(&*assets).unwrap());
+                publish(shared, collection, request, assets).await;
             }
-            let s = shared.clone();
-            let progress = move |done: usize, total: usize| {
-                s.send(Msg::Status(format!("Syncing {} of {} photos…", group(done), group(total))))
-            };
-            match immich.timeline(progress).await {
-                Ok(mut assets) => {
-                    assets.sort_by(|a, b| a.taken.cmp(&b.taken));
-                    let changed = cached.as_ref().is_none_or(|c| *c != assets);
-                    if changed {
-                        let _ = std::fs::create_dir_all(cache_dir());
-                        let _ = std::fs::write(&path, serde_json::to_vec(&assets).unwrap());
-                        publish(assets).await;
-                    }
-                    shared.send(Msg::Status(String::new()));
-                }
-                Err(e) => {
-                    log::error!("sync failed: {e:#}");
-                    shared.send(Msg::Status(format!("Sync failed: {e:#}")));
-                }
-            }
+            true
+        }
+        Err(e) => {
+            log::error!("sync {} failed: {e:#}", collection.key);
+            shared.status(request, format!("Sync failed: {e:#}"));
+            false
         }
     }
 }
