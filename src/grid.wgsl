@@ -19,6 +19,7 @@ struct Tile {
     @location(1) th: u32,
     @location(2) slot: u32,
     @location(3) fade: f32,
+    @location(4) flags: u32,
 };
 
 struct VOut {
@@ -28,6 +29,7 @@ struct VOut {
     @location(2) @interpolate(flat) slot: u32,
     @location(3) fade: f32,
     @location(4) size: f32,
+    @location(5) @interpolate(flat) flags: u32,
 };
 
 fn to_ndc(px: vec2f) -> vec4f {
@@ -44,6 +46,7 @@ fn vs_tile(@builtin(vertex_index) vi: u32, t: Tile) -> VOut {
     out.slot = t.slot;
     out.fade = t.fade;
     out.size = t.rect.z;
+    out.flags = t.flags;
     return out;
 }
 
@@ -74,7 +77,45 @@ fn fs_tile(v: VOut) -> @location(0) vec4f {
         }
         c = mix(c, img, v.fade);
     }
-    return vec4f(c.rgb, 1.0);
+    if (v.flags & 1u) != 0u {
+        c = vec4f(selected(c.rgb, v.uv, v.size), 1.0);
+    }
+    // Trashed/archived tiles dim away before the grid closes the gap.
+    let leaving = f32((v.flags >> 8u) & 255u) / 255.0;
+    return vec4f(mix(c.rgb, vec3f(0.004, 0.004, 0.005), leaving), 1.0);
+}
+
+// Apple-style selection: the photo dims slightly inside a thin accent inset, with a blue
+// check badge in the bottom-right corner (white ring, white tick). All SDFs in tile pixels.
+fn selected(rgb: vec3f, uv: vec2f, size: f32) -> vec3f {
+    let px = uv * size;
+    let s = g.view.w;
+    let accent = vec3f(0.0030, 0.235, 1.0); // #0a84ff in linear light
+    var c = rgb * 0.72;
+    let inset = min(min(px.x, px.y), min(size - px.x, size - px.y));
+    let ring = clamp(min(2.5 * s, size * 0.04), 1.0, 3.0 * s);
+    c = mix(c, accent, clamp(ring + 0.5 - inset, 0.0, 1.0));
+    if size < 24.0 * s {
+        return c;
+    }
+    let r = clamp(size * 0.09, 7.0 * s, 11.0 * s);
+    let center = vec2f(size - r - clamp(size * 0.05, 4.0 * s, 8.0 * s));
+    let d = length(px - center);
+    c = mix(c, vec3f(1.0), clamp(r + 0.5 - d, 0.0, 1.0));
+    c = mix(c, accent, clamp(r - 1.5 * s + 0.5 - d, 0.0, 1.0));
+    // Tick: two strokes through (-0.45, 0.0) → (-0.12, 0.33) → (0.45, -0.3), in units of r.
+    let q = (px - center) / r;
+    let tick = min(segment(q, vec2f(-0.45, 0.02), vec2f(-0.12, 0.33)), segment(q, vec2f(-0.12, 0.33), vec2f(0.45, -0.3)));
+    let w = 0.11;
+    c = mix(c, vec3f(1.0), clamp((w - tick) * r + 0.5, 0.0, 1.0));
+    return c;
+}
+
+fn segment(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
 }
 
 // Header scrim: content scrolls underneath a soft dark gradient.

@@ -113,6 +113,7 @@ pub struct Sidebar {
     /// Row key → (scale bits, label truncated to fit).
     labels: HashMap<String, (u32, String)>,
     rx: Receiver<Fetched>,
+    tx: Sender<Fetched>,
     pending: usize,
     last: Instant,
 }
@@ -124,7 +125,7 @@ impl Sidebar {
         if let Source::Immich(immich) = loader.source() {
             let wake = loader.waker();
             loader.handle().spawn(fetch_albums(immich.clone(), tx.clone(), wake.clone()));
-            loader.handle().spawn(fetch_people(immich.clone(), tx, wake));
+            loader.handle().spawn(fetch_people(immich.clone(), tx.clone(), wake));
             pending = 2;
         }
         let mut s = Self {
@@ -141,11 +142,30 @@ impl Sidebar {
             images: HashMap::new(),
             labels: HashMap::new(),
             rx,
+            tx,
             pending,
             last: Instant::now(),
         };
         s.rebuild();
         s
+    }
+
+    /// Albums as fetched for the sidebar, most recent first: (id, name, asset count).
+    pub fn albums(&self) -> Vec<(String, String, usize)> {
+        self.albums.iter().map(|a| (a.id.clone(), a.album_name.clone(), a.asset_count)).collect()
+    }
+
+    /// A row's thumbnail, e.g. "album:<id>", once loaded.
+    pub fn image(&self, key: &str) -> Option<ImageId> {
+        self.images.get(key).copied()
+    }
+
+    /// Fetches albums again (names, counts, covers), e.g. after photos were added to one.
+    pub fn refresh_albums(&mut self, loader: &Loader) {
+        if let Source::Immich(immich) = loader.source() {
+            self.pending += 1;
+            loader.handle().spawn(fetch_albums(immich.clone(), self.tx.clone(), loader.waker()));
+        }
     }
 
     /// True once albums, people and their thumbnails have all arrived.

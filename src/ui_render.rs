@@ -44,13 +44,13 @@ pub struct UiRenderer {
     images: HashMap<ImageId, Image>,
     next_image: ImageId,
     instances: wgpu::Buffer,
-    batches: [Vec<(u32, u32, Option<ImageId>)>; 2],
+    batches: [Vec<(u32, u32, Option<ImageId>)>; 3],
 
     font_system: FontSystem,
     swash: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
-    text: [TextRenderer; 2],
+    text: [TextRenderer; 3],
     buffers: HashMap<TextKey, (Buffer, f32)>,
 }
 
@@ -148,10 +148,7 @@ impl UiRenderer {
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
-        let text = [
-            TextRenderer::new(&mut atlas, device, Default::default(), None),
-            TextRenderer::new(&mut atlas, device, Default::default(), None),
-        ];
+        let text = std::array::from_fn(|_| TextRenderer::new(&mut atlas, device, Default::default(), None));
 
         // Solid quads still need something bound at group 1.
         let white = make_image(device, queue, &image_layout, 1, 1, &[255, 255, 255, 255], false).bind;
@@ -247,9 +244,9 @@ impl UiRenderer {
     }
 
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame, size: (u32, u32)) {
-        // Quads for both layers go into one buffer; batches split by bound image.
+        // Quads for all layers go into one buffer; batches split by bound image.
         let mut all = Vec::new();
-        for (li, layer) in [&frame.base, &frame.overlay].into_iter().enumerate() {
+        for (li, layer) in [&frame.base, &frame.overlay, &frame.popup].into_iter().enumerate() {
             self.batches[li].clear();
             for q in &layer.quads {
                 let start = all.len() as u32;
@@ -276,7 +273,7 @@ impl UiRenderer {
 
         self.viewport.update(queue, Resolution { width: size.0, height: size.1 });
         let mut used = HashSet::new();
-        for (li, layer) in [&frame.base, &frame.overlay].into_iter().enumerate() {
+        for (li, layer) in [&frame.base, &frame.overlay, &frame.popup].into_iter().enumerate() {
             let keys: Vec<TextKey> = layer.texts.iter().map(|t| text_key(t)).collect();
             for k in &keys {
                 self.shape(k);

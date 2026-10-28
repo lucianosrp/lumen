@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use image::{DynamicImage, RgbaImage, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +13,9 @@ pub struct Asset {
     pub video: bool,
     /// Base64 thumbhash, used as the instant placeholder.
     pub thumbhash: Option<String>,
+    /// Older disk caches predate this field.
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 impl Asset {
@@ -51,13 +56,125 @@ impl Library {
     pub fn len(&self) -> usize {
         self.assets.len()
     }
+
+    /// A copy without `remove` and with `add` merged in by date, reusing the decoded
+    /// placeholders, so a local edit (trash, archive, undo…) costs milliseconds rather than a
+    /// rebuild. Also returns where each old index went.
+    pub fn edit(&self, remove: &HashSet<String>, add: &[Asset]) -> (Library, Vec<Option<usize>>) {
+        enum From<'a> {
+            Old(usize),
+            New(&'a Asset),
+        }
+        let have: HashSet<&str> = self.assets.iter().map(|a| a.id.as_str()).collect();
+        let mut order: Vec<From> = (0..self.assets.len()).filter(|&i| !remove.contains(&self.assets[i].id)).map(From::Old).collect();
+        let mut seen = HashSet::new();
+        order.extend(add.iter().filter(|a| !have.contains(a.id.as_str()) && seen.insert(a.id.as_str())).map(From::New));
+        fn taken<'a>(lib: &'a Library, f: &From<'a>) -> &'a str {
+            match f {
+                From::Old(i) => &lib.assets[*i].taken,
+                From::New(a) => &a.taken,
+            }
+        }
+        // Stable, so equal timestamps keep their relative order.
+        order.sort_by(|a, b| taken(self, a).cmp(taken(self, b)));
+        let th = &self.thumbhashes;
+        if cell_size(order.len()) != th.cell {
+            let assets = order.iter().map(|f| match f { From::Old(i) => self.assets[*i].clone(), From::New(a) => (*a).clone() }).collect();
+            let lib = Library::new(assets);
+            let at: std::collections::HashMap<&str, usize> = lib.assets.iter().enumerate().map(|(i, a)| (a.id.as_str(), i)).collect();
+            let map = self.assets.iter().map(|a| at.get(a.id.as_str()).copied()).collect();
+            return (lib, map);
+        }
+
+        let (cell, cols) = (th.cell, th.cols);
+        let rows = (order.len().max(1) as u32).div_ceil(cols);
+        let mut levels: Vec<Vec<u8>> = (0..th.levels.len())
+            .map(|l| vec![0u8; (((th.width >> l).max(1)) * ((rows * cell) >> l).max(1) * 4) as usize])
+            .collect();
+        let mut map = vec![None; self.assets.len()];
+        let mut assets = Vec::with_capacity(order.len());
+        for (j, f) in order.iter().enumerate() {
+            let fresh = match f {
+                From::Old(i) => {
+                    map[*i] = Some(j);
+                    assets.push(self.assets[*i].clone());
+                    None
+                }
+                From::New(a) => {
+                    assets.push((*a).clone());
+                    Some(cell_mips(thumbhash_cell(a, cell), cell, th.levels.len()))
+                }
+            };
+            for (l, dst) in levels.iter_mut().enumerate() {
+                let (c, w) = ((cell >> l).max(1), (th.width >> l).max(1));
+                let at = |k: u32| (((k / cols) * c * w + (k % cols) * c) * 4) as usize;
+                let d = at(j as u32);
+                for row in 0..c {
+                    let o = (row * w * 4) as usize;
+                    let len = (c * 4) as usize;
+                    match (f, &fresh) {
+                        (From::Old(i), _) => {
+                            let s = at(*i as u32);
+                            dst[d + o..d + o + len].copy_from_slice(&th.levels[l][s + o..s + o + len]);
+                        }
+                        (_, Some(m)) => {
+                            let s = (row * c * 4) as usize;
+                            dst[d + o..d + o + len].copy_from_slice(&m[l][s..s + len]);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let videos = assets.iter().filter(|a| a.video).count();
+        let thumbhashes = ThumbhashAtlas { cell, cols, width: th.width, height: rows * cell, levels };
+        (Library { assets, thumbhashes, videos }, map)
+    }
+}
+
+/// Box-filtered mips of one cell, matching what the whole-atlas filter produces for it.
+fn cell_mips(base: Vec<u8>, cell: u32, count: usize) -> Vec<Vec<u8>> {
+    let mut out = vec![base];
+    let mut c = cell;
+    while out.len() < count {
+        let prev = out.last().unwrap();
+        let n = (c / 2).max(1);
+        let mut next = vec![0u8; (n * n * 4) as usize];
+        for y in 0..n {
+            for x in 0..n {
+                for k in 0..4 {
+                    let at = |xx: u32, yy: u32| prev[((yy.min(c - 1) * c + xx.min(c - 1)) * 4 + k) as usize] as u32;
+                    let sum = at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1);
+                    next[((y * n + x) * 4 + k) as usize] = (sum / 4) as u8;
+                }
+            }
+        }
+        out.push(next);
+        c = n;
+    }
+    out
+}
+
+/// One asset's placeholder, `cell`×`cell` RGBA8 (dark grey when it has no thumbhash).
+fn thumbhash_cell(a: &Asset, cell: u32) -> Vec<u8> {
+    use base64::Engine;
+    a.thumbhash
+        .as_deref()
+        .and_then(|h| base64::engine::general_purpose::STANDARD.decode(h).ok())
+        .and_then(|bytes| thumbhash::thumb_hash_to_rgba(&bytes).ok())
+        .and_then(|(w, h, rgba)| RgbaImage::from_raw(w as u32, h as u32, rgba))
+        .map(|img| DynamicImage::ImageRgba8(img).resize_to_fill(cell, cell, FilterType::Triangle).to_rgba8().into_raw())
+        .unwrap_or_else(|| [38u8, 38, 40, 255].repeat((cell * cell) as usize))
+}
+
+fn cell_size(n: usize) -> u32 {
+    // 16px cells hold up to 262k assets in an 8192² texture; shrink beyond that.
+    if n <= 262_144 { 16 } else if n <= 1_048_576 { 8 } else { 4 }
 }
 
 fn build_thumbhash_atlas(assets: &[Asset]) -> ThumbhashAtlas {
-    use base64::Engine;
     let n = assets.len().max(1) as u32;
-    // 16px cells hold up to 262k assets in an 8192² texture; shrink beyond that.
-    let cell = if n <= 262_144 { 16 } else if n <= 1_048_576 { 8 } else { 4 };
+    let cell = cell_size(n as usize);
     let cols = ATLAS_WIDTH / cell;
     let rows = n.div_ceil(cols);
     let (width, height) = (ATLAS_WIDTH, rows * cell);
@@ -73,22 +190,7 @@ fn build_thumbhash_atlas(assets: &[Asset]) -> ThumbhashAtlas {
                 s.spawn(move || {
                     part.iter()
                         .enumerate()
-                        .map(|(j, a)| {
-                            let px = a
-                                .thumbhash
-                                .as_deref()
-                                .and_then(|h| base64::engine::general_purpose::STANDARD.decode(h).ok())
-                                .and_then(|bytes| thumbhash::thumb_hash_to_rgba(&bytes).ok())
-                                .and_then(|(w, h, rgba)| RgbaImage::from_raw(w as u32, h as u32, rgba))
-                                .map(|img| {
-                                    DynamicImage::ImageRgba8(img)
-                                        .resize_to_fill(cell, cell, FilterType::Triangle)
-                                        .to_rgba8()
-                                        .into_raw()
-                                })
-                                .unwrap_or_else(|| [38u8, 38, 40, 255].repeat((cell * cell) as usize));
-                            (ci * chunk + j, px)
-                        })
+                        .map(|(j, a)| (ci * chunk + j, thumbhash_cell(a, cell)))
                         .collect()
                 })
             })
@@ -144,6 +246,7 @@ pub fn demo_assets(n: usize) -> Vec<Asset> {
                 ratio: 1.0,
                 video: i % 23 == 0,
                 thumbhash: Some(base64::engine::general_purpose::STANDARD.encode(hash)),
+                favorite: i % 17 == 0,
             }
         })
         .collect()

@@ -1,3 +1,4 @@
+mod actions;
 mod gestures;
 mod grid;
 mod immich;
@@ -71,6 +72,8 @@ struct Core {
     viewer: viewer::Viewer,
     /// The Places map, shown instead of the grid while open.
     map: Option<map::MapView>,
+    /// Selection, photo actions and their popovers.
+    actions: actions::Actions,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -81,6 +84,7 @@ impl Core {
     fn new(loader: Loader, renderer: Renderer, size: (u32, u32), scale: f32) -> Self {
         let sidebar = sidebar::Sidebar::new(&loader);
         let viewer = viewer::Viewer::new(&loader);
+        let actions = actions::Actions::new(&loader);
         Self {
             loader,
             renderer,
@@ -102,6 +106,7 @@ impl Core {
             collection: Arc::new(Collection::library()),
             viewer,
             map: None,
+            actions,
         }
     }
 
@@ -139,6 +144,11 @@ impl Core {
                     // A different collection starts at its newest photos; a refresh keeps its place.
                     let refresh = self.library.is_some() && collection.key == self.collection.key;
                     self.collection = collection;
+                    if refresh {
+                        // Keeps thumbnails, selection and scroll: a refresh that matches the screen is invisible.
+                        actions::refresh(self, library, generation);
+                        continue;
+                    }
                     self.renderer.set_library(&library);
                     self.layout.reset(library.len(), refresh);
                     self.library = Some(library);
@@ -150,6 +160,7 @@ impl Core {
                 Msg::Thumb(_) => {}
             }
         }
+        actions::pump(self, Instant::now());
     }
 
     /// Advances animations and rebuilds the frame. Returns true while anything is still moving.
@@ -280,7 +291,7 @@ impl Core {
                 // Hairline gaps when tiles are big enough to read as photos; a seamless mosaic below.
                 let gap = if size < 40.0 * self.scale { 0.0 } else { (size * 0.012).clamp(1.0, 2.0 * self.scale) };
                 rect = [self.left + rect[0] + gap / 2.0, rect[1] + gap / 2.0, rect[2] - gap, rect[3] - gap];
-                self.instances.push(Instance { rect, th: i as u32, slot, fade: ease_out(fade), _pad: 0.0 });
+                self.instances.push(Instance { rect, th: i as u32, slot, fade: ease_out(fade), flags: self.actions.flags(i, now) });
             }
         }
 
@@ -299,9 +310,10 @@ impl Core {
 
         let (lib, overlay) = (self.library.as_ref(), &mut self.ui.overlay);
         let viewing = self.viewer.update(now, lib, &mut self.layout, self.left, self.scale, self.size, &mut self.renderer, overlay);
+        let acting = actions::draw(self, now);
 
         self.build_header();
-        sidebar_moving || viewing || fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
+        sidebar_moving || viewing || acting || fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
     }
 
     /// Handles a sidebar click (or `--select`).
@@ -513,6 +525,11 @@ impl ApplicationHandler for App {
         let (Some(core), Some(gpu), Some(window)) = (&mut self.core, &mut self.gpu, &self.window) else { return };
         let now = Instant::now();
         let scale = window.scale_factor() as f32;
+        // Popovers, selection clicks and action shortcuts come before everything else.
+        if actions::input(core, &event, self.modifiers) {
+            window.request_redraw();
+            return;
+        }
         // The viewer captures input while it's open.
         if core.viewer.is_open() && core.viewer.input(&event, self.modifiers, now) {
             window.request_redraw();
@@ -717,6 +734,7 @@ struct Shot {
     map: Option<map::Shot>,
     /// Simulated touchpad pinch: final scale, and whether the fingers lift.
     pinch: Option<(f32, bool)>,
+    actions: Option<actions::Shot>,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -745,6 +763,7 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
                 && core.sidebar.is_idle()
                 && core.status.is_empty()
                 && !core.viewer.loading()
+                && core.actions.is_idle()
                 && core.map.as_ref().is_none_or(|m| m.is_idle());
             quiet = if done { quiet + 1 } else { 0 };
         }
@@ -828,6 +847,11 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
         }
         core.update(Instant::now());
     }
+    if let Some(a) = &shot.actions {
+        actions::drive(&mut core, a, &settle)?;
+        core.pump();
+        core.update(Instant::now());
+    }
 
     if let Some((scale, end)) = shot.pinch {
         // Thirty finger updates over ~half a second, like a real gesture.
@@ -886,6 +910,9 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
     }
     img.save(path)?;
     println!("wrote {path}");
+    if let Some(a) = &shot.actions {
+        actions::after(&mut core, a, &settle)?;
+    }
     Ok(())
 }
 
@@ -938,6 +965,7 @@ fn main() -> Result<()> {
                 play_wait: flag("--play-wait").and_then(|s| s.parse().ok()),
             }),
             map: map::Shot::parse(&args),
+            actions: actions::Shot::parse(&args),
             pinch: flag("--pinch").and_then(|s| {
                 let (v, end) = s.strip_suffix(",end").map_or((s.as_str(), false), |v| (v, true));
                 Some((v.parse().ok()?, end))
