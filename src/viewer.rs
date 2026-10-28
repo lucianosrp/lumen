@@ -15,6 +15,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, Wind
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::grid::{Layout, Spec};
+use crate::hover::{self, Clip};
 use crate::library::{self, Library};
 use crate::loader::{Loader, Source, thumbnail_bytes};
 use crate::render::Renderer;
@@ -38,6 +39,8 @@ const VIDEO_MAX: u32 = 1920;
 const SEEK_STEP: f64 = 5.0;
 /// How long the first frame may take before the spinner shows.
 const SPINNER_AFTER: Duration = Duration::from_millis(250);
+/// Pressing and holding a Live Photo this long plays its motion while held.
+const LIVE_HOLD: Duration = Duration::from_millis(300);
 
 const HASH: usize = 0;
 const THUMB: usize = 1;
@@ -138,6 +141,8 @@ enum Hit {
     Mute,
     Volume,
     Bar,
+    /// The "LIVE" pill on Live Photos.
+    Live,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -202,6 +207,12 @@ struct Open {
     screen: (f32, f32),
     /// Width of the original in pixels, for 1:1 zoom.
     native_width: f32,
+    /// When the left button went down (press-and-hold plays a Live Photo).
+    press_at: Option<Instant>,
+    /// The Live Photo's motion is playing because the button is held.
+    live_held: bool,
+    /// The mouse was over the LIVE pill last frame.
+    over_live: bool,
 }
 
 pub struct Viewer {
@@ -225,9 +236,14 @@ pub struct Viewer {
     volume: f64,
     drag: Option<Drag>,
     play_request: Option<f64>,
+    /// A Live Photo's motion clip, playing once over the still.
+    live: Option<Clip>,
+    /// Play the motion on the next update: Some(true) toggles, Some(false) only starts.
+    live_request: Option<bool>,
 }
 
 /// What headless screenshot mode should show.
+#[derive(Default)]
 pub struct Shot {
     pub at: String,
     pub open_at: Option<u64>,
@@ -239,6 +255,8 @@ pub struct Shot {
     pub play_at: Option<f64>,
     /// Instead of waiting for that frame, render after this many ms (buffering state).
     pub play_wait: Option<u64>,
+    /// Play the Live Photo's motion and render this many ms after its first frame.
+    pub live_at: Option<u64>,
 }
 
 impl Shot {
@@ -278,6 +296,8 @@ impl Viewer {
             volume: 1.0,
             drag: None,
             play_request: None,
+            live: None,
+            live_request: None,
         }
     }
 
@@ -313,6 +333,9 @@ impl Viewer {
             hits: Vec::new(),
             screen: (1.0, 1.0),
             native_width: 0.0,
+            press_at: None,
+            live_held: false,
+            over_live: false,
         });
     }
 
@@ -442,6 +465,7 @@ impl Viewer {
                             self.drag_to(d, false);
                         } else {
                             o.press = Some((o.cursor, o.pan));
+                            o.press_at = Some(now);
                             o.dragged = false;
                         }
                     }
@@ -451,7 +475,13 @@ impl Viewer {
                             return true;
                         }
                         let clicked = o.press.take().is_some() && !o.dragged;
-                        if clicked {
+                        o.press_at = None;
+                        if std::mem::take(&mut o.live_held) {
+                            // Letting go of a press-and-hold ends the motion; it isn't a click.
+                            if let Some(c) = &mut self.live {
+                                c.stop(now);
+                            }
+                        } else if clicked {
                             self.click(now);
                         }
                     }
@@ -510,6 +540,7 @@ impl Viewer {
                     Key::Named(NamedKey::ArrowDown) if video => self.set_volume(self.volume - 0.1),
                     Key::Named(NamedKey::Space | NamedKey::Enter) => self.play(),
                     Key::Character("m") => self.toggle_mute(),
+                    Key::Character("l") => self.live_request = Some(true),
                     Key::Character("i") => o.panel = !o.panel,
                     Key::Character("=" | "+") => o.zoom_by(1.5, center),
                     Key::Character("-" | "_") => o.zoom_by(1.0 / 1.5, center),
@@ -534,6 +565,7 @@ impl Viewer {
             Some(Hit::Info) => o.panel = !o.panel,
             Some(Hit::Play | Hit::Toggle) => self.play(),
             Some(Hit::Mute) => self.toggle_mute(),
+            Some(Hit::Live) => self.live_request = Some(false),
             Some(Hit::Panel | Hit::Bar | Hit::Scrub | Hit::Volume) => {}
             None if contains(o.clip, p.0, p.1) => {
                 let double = o.last_click.is_some_and(|(t, q)| {
@@ -568,6 +600,19 @@ impl Viewer {
             }
             None if video::available() => self.start_video(id, None, screen),
             None => {}
+        }
+    }
+
+    /// Plays the current Live Photo's motion once (from the start) on the next update.
+    pub fn play_live(&mut self) {
+        self.live_request = Some(false);
+    }
+
+    /// Headless: the motion clip's status, and how long its first frame has been up.
+    pub fn live_status(&self) -> (String, Option<Duration>) {
+        match &self.live {
+            Some(c) => (c.status(), c.shown_for(Instant::now())),
+            None => ("clip: none".into(), None),
         }
     }
 
@@ -609,6 +654,8 @@ impl Viewer {
             start_at,
             muted: self.muted,
             volume: self.volume,
+            looping: None,
+            no_audio: false,
         };
         let uri = format!("{}/api/assets/{id}/video/playback", immich.base());
         let player = match Player::new(&uri, immich.api_key(), opts, self.wake.clone()) {
@@ -667,6 +714,72 @@ impl Viewer {
             && let Some((tex, _, _)) = v.tex
         {
             r.ui.free_image(tex);
+        }
+    }
+
+    /// Starts/stops the Live Photo motion clip and uploads its frames. Returns true while fading.
+    fn sync_live(&mut self, o: &mut Open, now: Instant, r: &mut Renderer) -> bool {
+        let asset = &o.lib.assets[o.index];
+        let motion = asset.live_video.clone().filter(|_| matches!(o.phase, Phase::Shown | Phase::Opening(_)));
+        if self.live.as_ref().is_some_and(|c| c.id != asset.id || motion.is_none()) {
+            self.stop_live(r);
+            o.live_held = false;
+        }
+        // Hovering the LIVE pill plays the motion, like Photos on the Mac.
+        let over = o.hits.iter().any(|(h, rect)| *h == Hit::Live && contains(*rect, o.cursor.0, o.cursor.1));
+        if over && !o.over_live {
+            self.live_request.get_or_insert(false);
+        }
+        o.over_live = over;
+        // So does pressing and holding the photo, for as long as it's held.
+        let mut busy = false;
+        if let (Some(at), Some((p, _)), Some(_)) = (o.press_at, o.press, &motion)
+            && !o.dragged
+            && !o.live_held
+            && contains(o.clip, p.0, p.1)
+        {
+            if now.duration_since(at) >= LIVE_HOLD {
+                o.live_held = true;
+                self.live_request = Some(false);
+            } else {
+                busy = true;
+            }
+        }
+        if let (Some(toggle), Some(video)) = (self.live_request.take(), &motion)
+            && let Source::Immich(immich) = &self.source
+        {
+            match &mut self.live {
+                Some(c) if toggle && !c.stopped() => c.stop(now),
+                Some(c) if !c.stopped() => {}
+                old => {
+                    if let Some(mut c) = old.take() {
+                        c.release(r);
+                    }
+                    let opts = video::Options {
+                        max_side: (o.screen.0.max(o.screen.1) as u32).min(VIDEO_MAX),
+                        silent: self.silent,
+                        start_at: None,
+                        muted: self.muted,
+                        volume: self.volume,
+                        looping: Some(false),
+                        no_audio: self.silent,
+                    };
+                    self.live = Some(Clip::start(immich, video, asset.id.clone(), opts, self.wake.clone()));
+                }
+            }
+        }
+        if let Some(c) = &mut self.live {
+            busy |= c.tick(now, r);
+            if c.finished(now) {
+                self.stop_live(r);
+            }
+        }
+        busy
+    }
+
+    fn stop_live(&mut self, r: &mut Renderer) {
+        if let Some(mut c) = self.live.take() {
+            c.release(r);
         }
     }
 
@@ -748,6 +861,7 @@ impl Viewer {
         self.last_tick = now;
         let Some(mut o) = self.open.take() else {
             self.stop_video(r);
+            self.stop_live(r);
             if !self.slots.is_empty() {
                 self.free_all(r);
             }
@@ -779,6 +893,7 @@ impl Viewer {
 
         self.receive(r, &current, now);
         self.sync_video(&o, now, r);
+        let live_busy = self.sync_live(&mut o, now, r);
 
         // Phase transitions.
         let slot = self.slots.get(&current);
@@ -789,6 +904,7 @@ impl Viewer {
             Phase::Opening(t) if now.duration_since(t).as_secs_f32() >= OPEN_TIME => o.phase = Phase::Shown,
             Phase::Closing { start, .. } if now.duration_since(start).as_secs_f32() >= CLOSE_TIME => {
                 self.stop_video(r);
+                self.stop_live(r);
                 self.free_all(r);
                 return true;
             }
@@ -808,7 +924,7 @@ impl Viewer {
 
         let busy = self.draw(&mut o, now, dt, layout, left, scale, r, out);
         self.open = Some(o);
-        busy || !self.queue.is_empty()
+        busy || live_busy || !self.queue.is_empty()
     }
 
     /// Uploads finished decodes: every small one, but at most one big one per frame.
@@ -1104,6 +1220,14 @@ impl Viewer {
             busy |= f < 1.0;
             out.quad(Quad::image(mv(clip), tex, uv_of(img, clip), alpha * ease_out(f), 0.0));
         }
+        // A Live Photo's motion, crossfading in over the still and back out at the end.
+        if let Some(c) = self.live.as_ref().filter(|c| c.id == asset.id)
+            && let Some((tex, _, _)) = c.image()
+            && clip[2] > 0.0
+            && clip[3] > 0.0
+        {
+            out.quad(Quad::image(mv(clip), tex, uv_of(img, clip), alpha * c.alpha(now), 0.0));
+        }
 
         // Chrome fades with the open/close progress and after a while without the mouse.
         let progress = match o.phase {
@@ -1132,6 +1256,9 @@ impl Viewer {
             if o.panel {
                 self.draw_panel(o, details, ca, s, r, out);
             }
+        }
+        if asset.live_video.is_some() && ca > 0.003 && o.slide.is_none() {
+            self.draw_live_pill(o, ca, s, r, out);
         }
         if asset.video && progress > 0.0 {
             busy |= self.draw_video_overlay(o, playback, progress, ca, dx, s, now, r, out);
@@ -1270,6 +1397,28 @@ impl Viewer {
         o.hits.push((Hit::Mute, [mute_cx - 14.0 * s, cy - 14.0 * s, 28.0 * s, 28.0 * s]));
         o.hits.push((Hit::Volume, vol));
         o.hits.push((Hit::Bar, bar));
+    }
+
+    /// "LIVE" pill at the photo's top-left (below the top bar); hover or click it to play.
+    fn draw_live_pill(&self, o: &mut Open, ca: f32, s: f32, r: &mut Renderer, out: &mut Layer) {
+        let size = 11.5 * s;
+        let label_w = r.ui.measure("LIVE", size, 700, crate::ui::Font::Sans);
+        let (ph, icon) = (24.0 * s, 15.0 * s);
+        let pw = 9.0 * s + icon + 5.0 * s + label_w + 10.0 * s;
+        let x = (o.clip[0] + 12.0 * s).max(16.0 * s);
+        let y = (o.clip[1] + 12.0 * s).max(62.0 * s);
+        let pill = [x, y, pw, ph];
+        let playing = self.live.as_ref().is_some_and(|c| !c.stopped());
+        let bg = if playing { rgb(0xffffff, 0.30 * ca) } else { rgb(0x1c1c1e, 0.62 * ca) };
+        out.quad(Quad::solid(pill, bg, ph / 2.0));
+        let cy = y + ph / 2.0;
+        out.text(Text::new(hover::LIVE_GLYPH, x + 9.0 * s, cy - icon * 0.625, icon).icon().color(fade_color(theme::TEXT, ca)));
+        out.text(
+            Text::new("LIVE", x + 9.0 * s + icon + 5.0 * s, cy - size * 0.625, size)
+                .weight(700)
+                .color(fade_color(theme::TEXT, ca)),
+        );
+        o.hits.push((Hit::Live, pill));
     }
 
     fn draw_chrome(&self, o: &mut Open, details: Option<&Details>, ca: f32, s: f32, out: &mut Layer) {

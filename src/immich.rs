@@ -27,6 +27,11 @@ struct BucketAssets {
     thumbhash: Vec<Option<String>>,
     file_created_at: Vec<String>,
     is_image: Vec<bool>,
+    #[serde(default)]
+    live_photo_video_id: Vec<Option<String>>,
+    /// Milliseconds on current servers; "0:00:11.001" on older ones.
+    #[serde(default)]
+    duration: Vec<Option<serde_json::Value>>,
 }
 
 impl Immich {
@@ -84,6 +89,8 @@ impl Immich {
                     ratio: cols.ratio.get(i).copied().flatten().unwrap_or(1.0) as f32,
                     video: !cols.is_image.get(i).copied().unwrap_or(true),
                     thumbhash: cols.thumbhash.get(i).cloned().flatten(),
+                    live_video: cols.live_photo_video_id.get(i).cloned().flatten(),
+                    duration_ms: cols.duration.get(i).and_then(|d| duration_ms(d.as_ref()?)),
                 });
             }
             progress(done, total);
@@ -108,4 +115,16 @@ impl Immich {
         let res = self.get(&format!("/assets/{id}/thumbnail?size=thumbnail")).await?;
         Ok(res.bytes().await?.to_vec())
     }
+}
+
+/// 11001 (ms) or "0:00:11.001" → 11001; None for zero or unparsable.
+fn duration_ms(d: &serde_json::Value) -> Option<u32> {
+    let secs = match d {
+        serde_json::Value::Number(ms) => ms.as_f64()? / 1000.0,
+        serde_json::Value::String(s) => {
+            s.split(':').try_fold(0.0, |acc, p| p.trim().parse::<f64>().ok().map(|v| acc * 60.0 + v))?
+        }
+        _ => return None,
+    };
+    (secs > 0.0).then(|| (secs * 1000.0).round().min(u32::MAX as f64) as u32)
 }

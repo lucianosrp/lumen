@@ -1,5 +1,6 @@
 mod gestures;
 mod grid;
+mod hover;
 mod immich;
 mod library;
 mod live;
@@ -76,6 +77,10 @@ struct Core {
     // feat/settings: preferences, and the Settings page shown instead of the grid while open.
     settings: settings::Settings,
     settings_page: Option<settings_ui::Page>,
+    // Hover previews (hover.rs): grid tiles play videos / Live Photos under a resting mouse.
+    hover: hover::Hover,
+    /// Settings › play on hover. Off disables all grid hover previews.
+    hover_play: bool,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -116,6 +121,8 @@ impl Core {
             live,
             settings,
             settings_page: None,
+            hover: hover::Hover::new(),
+            hover_play: true,
         };
         settings::apply(&mut core);
         core
@@ -180,6 +187,9 @@ impl Core {
         let frame = self.frame;
         self.ui.clear();
         let sidebar_moving = sidebar::update(self, now);
+        // Settings › Playback: hover previews and their sound.
+        self.hover_play = self.settings.hover_play;
+        self.hover.sound = self.settings.hover_sound;
 
         // The Settings page replaces the grid, like the map below (feat/settings).
         if self.settings_page.is_some() {
@@ -197,6 +207,8 @@ impl Core {
             map.draw(&mut self.ui);
             let added = self.ui.base.quads.len() - before;
             self.ui.base.quads.rotate_right(added);
+            hover::update(self, now); // stops any grid preview
+
             self.build_header();
             return busy || sidebar_moving;
         }
@@ -323,11 +335,14 @@ impl Core {
             self.pending.pop_front();
         }
 
+        // Hover previews and tile badges, over the tiles but under the sidebar.
+        let hovering = hover::update(self, now);
+
         let (lib, overlay) = (self.library.as_ref(), &mut self.ui.overlay);
         let viewing = self.viewer.update(now, lib, &mut self.layout, self.left, self.scale, self.size, &mut self.renderer, overlay);
 
         self.build_header();
-        sidebar_moving || viewing || fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
+        sidebar_moving || viewing || fading || hovering || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
     }
 
     /// Handles a sidebar click (or `--select`).
@@ -588,11 +603,13 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
                 core.sidebar.cursor = self.cursor;
+                core.hover.cursor = Some(self.cursor);
                 window.request_redraw();
             }
             // Sidebar: hover, clicks, its own scrolling.
             WindowEvent::CursorLeft { .. } => {
                 core.sidebar.cursor = (-1.0, -1.0);
+                core.hover.cursor = None;
                 window.request_redraw();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
@@ -763,6 +780,10 @@ struct Shot {
     // feat/settings: `--set key=value` overrides, and `--settings` page options.
     settings: settings::Settings,
     page: Option<settings_ui::Shot>,
+    /// Mouse resting on this tile (asset id, index, or screen point "x,y"; "a+b" moves on to
+    /// b): render once the (last) preview plays, plus `hover_wait` ms.
+    hover: Option<String>,
+    hover_wait: u64,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -776,6 +797,7 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
     core.sidebar.set_shown(shot.sidebar);
     // Videos only play when asked (--play-at), and never out loud.
     (core.viewer.autoplay, core.viewer.silent) = (false, true);
+    (core.hover.silent, core.hover.instant) = (true, true);
 
     let settle = |core: &mut Core| -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -869,6 +891,23 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
             }
             println!("{} after {:.0} ms", core.viewer.video_status(), start.elapsed().as_secs_f64() * 1000.0);
         }
+        if let Some(ms) = shot.live_at {
+            core.viewer.play_live();
+            let start = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+                core.pump();
+                core.update(Instant::now());
+                let (status, shown) = core.viewer.live_status();
+                if shown.is_some_and(|d| d >= Duration::from_millis(ms)) {
+                    println!("{status}");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(60) {
+                    bail!("timed out waiting for the Live Photo's motion ({status})");
+                }
+            }
+        }
         if let Some(ms) = shot.open_at {
             core.viewer.rewind(ms);
         }
@@ -894,6 +933,39 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
             core.sidebar.cursor = at;
             settle(&mut core)?;
         }
+    }
+    // Hover preview: rest the mouse on a tile and wait for its video to play.
+    for at in shot.hover.iter().flat_map(|h| h.split('+')) {
+        let point = at.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)));
+        core.hover.cursor = match point {
+            Some(p) => Some(p),
+            None => {
+                let lib = core.library.clone().context("no library")?;
+                let i = viewer::Shot { at: at.to_string(), ..Default::default() }.index(&lib);
+                viewer::reveal(&mut core.layout, i);
+                settle(&mut core)?;
+                let r = core.instances.iter().find(|t| t.th as usize == i).map(|t| t.rect).context("tile not on screen")?;
+                Some((r[0] + r[2] / 2.0, r[1] + r[3] / 2.0))
+            }
+        };
+        let start = Instant::now();
+        let mut ready = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+            core.pump();
+            core.update(Instant::now());
+            let clip = core.hover.clip();
+            if ready.is_none() && clip.is_some_and(|c| c.ready(Instant::now())) {
+                ready = Some(Instant::now());
+            }
+            if ready.is_some_and(|t| t.elapsed() >= Duration::from_millis(shot.hover_wait)) {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                bail!("timed out waiting for a hover preview ({})", clip.map_or("none".into(), |c| c.status()));
+            }
+        }
+        println!("hover: {}", core.hover.clip().map_or("none".into(), |c| c.status()));
     }
 
     if let Some((scale, end)) = shot.pinch {
@@ -1009,7 +1081,7 @@ fn main() -> Result<()> {
             fit: args.iter().any(|a| a == "--fit"),
             select: flag("--select"),
             sidebar: !args.iter().any(|a| a == "--no-sidebar"),
-            viewer: flag("--open").map(|at| viewer::Shot {
+            viewer: flag("--open").or(flag("--live")).map(|at| viewer::Shot {
                 at,
                 open_at: flag("--open-at").and_then(|s| s.parse().ok()),
                 info: args.iter().any(|a| a == "--info"),
@@ -1018,6 +1090,7 @@ fn main() -> Result<()> {
                 close_at: flag("--close-at").and_then(|s| s.parse().ok()),
                 play_at: flag("--play-at").and_then(|s| s.parse().ok()),
                 play_wait: flag("--play-wait").and_then(|s| s.parse().ok()),
+                live_at: flag("--live").map(|_| flag("--live-at").and_then(|s| s.parse().ok()).unwrap_or(700)),
             }),
             map: map::Shot::parse(&args),
             pinch: flag("--pinch").and_then(|s| {
@@ -1026,6 +1099,8 @@ fn main() -> Result<()> {
             }),
             settings: settings_from(&args)?,
             page: settings_ui::Shot::parse(&args),
+            hover: flag("--hover"),
+            hover_wait: flag("--hover-wait").and_then(|s| s.parse().ok()).unwrap_or(0),
         };
         return screenshot(source, &path, size, scale, shot);
     }

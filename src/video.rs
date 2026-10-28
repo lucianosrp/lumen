@@ -1,7 +1,7 @@
 //! In-viewer video playback on GStreamer: playbin3 streams from Immich, an appsink hands
 //! RGBA frames to the UI thread, which uploads the latest one into a texture.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -62,6 +62,7 @@ struct Slot {
     fresh: bool,
 }
 
+#[derive(Clone)]
 pub struct Options {
     /// Frames are scaled down in the pipeline so neither side exceeds this.
     pub max_side: u32,
@@ -70,7 +71,21 @@ pub struct Options {
     pub start_at: Option<f64>,
     pub muted: bool,
     pub volume: f64,
+    /// Loop at the end: always, never, or (None) only clips shorter than `LOOP_UNDER`.
+    pub looping: Option<bool>,
+    /// Don't even decode the audio track (grid hover previews).
+    pub no_audio: bool,
 }
+
+impl Options {
+    /// A muted, looping preview whose frames fit `max_side` (grid hover, Live Photo motion).
+    pub fn preview(max_side: u32) -> Self {
+        Self { max_side, silent: true, start_at: None, muted: true, volume: 0.0, looping: Some(true), no_audio: true }
+    }
+}
+
+/// Pipelines built and not yet torn down, for leak checks in the logs.
+static ALIVE: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Player {
     playbin: gst::Element,
@@ -91,6 +106,7 @@ pub struct Player {
     pub frames: u64,
     pub last_pts: f64,
     logged: bool,
+    looping: Option<bool>,
 }
 
 impl Player {
@@ -191,13 +207,34 @@ impl Player {
 
         // Wake the UI for bus messages; it drains them in `tick`.
         let bus = playbin.bus().context("bus")?;
-        bus.set_sync_handler(move |_, _| {
+        let weak = playbin.downgrade();
+        let video_only = opts.no_audio;
+        bus.set_sync_handler(move |_, msg| {
+            // Video only: pick the streams right here, before decodebin3 exposes (and the
+            // sinks wait to preroll on) an audio stream we'd drop later.
+            if let gst::MessageView::StreamCollection(c) = msg.view()
+                && video_only
+                && let Some(playbin) = weak.upgrade()
+            {
+                let ids: Vec<String> = c
+                    .stream_collection()
+                    .iter()
+                    .filter(|s| s.stream_type().contains(gst::StreamType::VIDEO))
+                    .filter_map(|s| s.stream_id().map(|id| id.to_string()))
+                    .take(1)
+                    .collect();
+                if !ids.is_empty() {
+                    playbin.send_event(gst::event::SelectStreams::new(ids.iter().map(String::as_str)));
+                }
+            }
             wake();
             gst::BusSyncReply::Pass
         });
 
         // Preroll paused first so a start position can be applied before anything plays.
         playbin.set_state(gst::State::Paused).context("couldn't start the pipeline")?;
+        let alive = ALIVE.fetch_add(1, Ordering::Relaxed) + 1;
+        log::info!("video: pipeline up ({max_side}px max, {alive} alive)");
         Ok(Self {
             playbin,
             slot,
@@ -214,6 +251,7 @@ impl Player {
             frames: 0,
             last_pts: 0.0,
             logged: false,
+            looping: opts.looping,
         })
     }
 
@@ -247,8 +285,9 @@ impl Player {
                 }
                 M::DurationChanged(_) => self.duration = None,
                 M::Eos(_) => {
-                    let looping = LOOP_SHORT.load(std::sync::atomic::Ordering::Relaxed);
-                    if looping && self.duration.is_some_and(|d| d < LOOP_UNDER) && self.want_playing {
+                    let short = self.duration.is_some_and(|d| d < LOOP_UNDER);
+                    let loop_short = LOOP_SHORT.load(std::sync::atomic::Ordering::Relaxed);
+                    if self.looping.unwrap_or(short && loop_short) && self.want_playing {
                         self.seek_now(0.0, false);
                     } else {
                         self.ended = true;
@@ -401,6 +440,8 @@ impl Drop for Player {
         let playbin = self.playbin.clone();
         std::thread::spawn(move || {
             let _ = playbin.set_state(gst::State::Null);
+            let alive = ALIVE.fetch_sub(1, Ordering::Relaxed) - 1;
+            log::info!("video: pipeline torn down ({alive} alive)");
         });
     }
 }
