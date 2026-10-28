@@ -1,0 +1,153 @@
+//! Immediate-mode drawing list for everything that isn't the photo grid.
+//!
+//! Each frame, features push rounded rects, images and text into a `Frame`; the renderer
+//! draws `base` over the grid, then `overlay` on top of everything (viewer, popovers).
+//! All coordinates are physical pixels, origin top-left.
+
+pub type ImageId = u64;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Font {
+    Sans,
+    /// Nerd Font glyphs, e.g. "\u{f03e}" (image), "\u{f004}" (heart).
+    Icons,
+}
+
+#[derive(Clone, Debug)]
+pub struct Quad {
+    pub rect: [f32; 4],
+    /// Straight-alpha sRGB colour; multiplies the image when there is one.
+    pub color: [f32; 4],
+    pub radius: f32,
+    pub image: Option<ImageId>,
+    /// Image sub-rectangle in 0..1 texture coordinates: [u0, v0, u1, v1].
+    pub uv: [f32; 4],
+}
+
+impl Quad {
+    pub fn solid(rect: [f32; 4], color: [f32; 4], radius: f32) -> Self {
+        Self { rect, color, radius, image: None, uv: [0.0, 0.0, 1.0, 1.0] }
+    }
+
+    pub fn image(rect: [f32; 4], image: ImageId, uv: [f32; 4], opacity: f32, radius: f32) -> Self {
+        Self { rect, color: [1.0, 1.0, 1.0, opacity], radius, image: Some(image), uv }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Text {
+    pub text: String,
+    /// Anchor point; `align` says whether x is the left edge, centre or right edge.
+    pub x: f32,
+    /// Top of the line box.
+    pub y: f32,
+    pub size: f32,
+    pub weight: u16,
+    pub color: [u8; 4],
+    pub font: Font,
+    pub align: Align,
+    /// Wrap/ellipsis width; None for a single unbounded line.
+    pub max_width: Option<f32>,
+    /// Clip rectangle [x, y, w, h].
+    pub clip: Option<[f32; 4]>,
+}
+
+impl Text {
+    pub fn new(text: impl Into<String>, x: f32, y: f32, size: f32) -> Self {
+        Self {
+            text: text.into(),
+            x,
+            y,
+            size,
+            weight: 400,
+            color: [255, 255, 255, 255],
+            font: Font::Sans,
+            align: Align::Left,
+            max_width: None,
+            clip: None,
+        }
+    }
+    pub fn weight(mut self, w: u16) -> Self {
+        self.weight = w;
+        self
+    }
+    pub fn color(mut self, c: [u8; 4]) -> Self {
+        self.color = c;
+        self
+    }
+    pub fn icon(mut self) -> Self {
+        self.font = Font::Icons;
+        self
+    }
+    pub fn align(mut self, a: Align) -> Self {
+        self.align = a;
+        self
+    }
+    pub fn max_width(mut self, w: f32) -> Self {
+        self.max_width = Some(w);
+        self
+    }
+    pub fn clip(mut self, r: [f32; 4]) -> Self {
+        self.clip = Some(r);
+        self
+    }
+}
+
+#[derive(Default)]
+pub struct Layer {
+    pub quads: Vec<Quad>,
+    pub texts: Vec<Text>,
+}
+
+impl Layer {
+    pub fn quad(&mut self, q: Quad) {
+        self.quads.push(q);
+    }
+    pub fn text(&mut self, t: Text) {
+        self.texts.push(t);
+    }
+    pub fn clear(&mut self) {
+        self.quads.clear();
+        self.texts.clear();
+    }
+}
+
+#[derive(Default)]
+pub struct Frame {
+    pub base: Layer,
+    pub overlay: Layer,
+}
+
+impl Frame {
+    pub fn clear(&mut self) {
+        self.base.clear();
+        self.overlay.clear();
+    }
+}
+
+/// 0xRRGGBB plus alpha, as a straight-alpha sRGB colour.
+pub fn rgb(hex: u32, a: f32) -> [f32; 4] {
+    [((hex >> 16) & 255) as f32 / 255.0, ((hex >> 8) & 255) as f32 / 255.0, (hex & 255) as f32 / 255.0, a]
+}
+
+pub fn contains(r: [f32; 4], x: f32, y: f32) -> bool {
+    x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3]
+}
+
+/// Shared palette so features look like one app.
+pub mod theme {
+    pub const BG: u32 = 0x010101;
+    pub const SIDEBAR: u32 = 0x161618;
+    pub const SEPARATOR: u32 = 0x2a2a2d;
+    pub const ACCENT: u32 = 0x0a84ff;
+    pub const TEXT: [u8; 4] = [255, 255, 255, 235];
+    pub const TEXT_DIM: [u8; 4] = [255, 255, 255, 150];
+    pub const TEXT_FAINT: [u8; 4] = [255, 255, 255, 95];
+}

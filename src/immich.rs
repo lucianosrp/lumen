@@ -43,7 +43,8 @@ impl Immich {
         &self.base
     }
 
-    async fn get(&self, path: &str) -> Result<reqwest::Response> {
+    /// GET `/api{path}` with auth; errors on non-2xx.
+    pub async fn get(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}/api{}", self.base, path);
         let res = self
             .http
@@ -87,6 +88,18 @@ impl Immich {
             progress(done, total);
         }
         Ok(assets)
+    }
+
+    pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        Ok(self.get(path).await?.json().await?)
+    }
+
+    pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        Ok(self.get(path).await?.bytes().await?.to_vec())
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.key
     }
 
     /// The server-made ~250px WebP thumbnail.

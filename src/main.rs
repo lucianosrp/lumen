@@ -3,6 +3,8 @@ mod immich;
 mod library;
 mod loader;
 mod render;
+mod ui;
+mod ui_render;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -18,7 +20,8 @@ use winit::window::{Fullscreen, Theme, Window, WindowId};
 use grid::{Layout, Viewport};
 use library::Library;
 use loader::{Loader, Msg, Source, Thumb, Tier, group};
-use render::{Instance, LARGE_BIT, NO_SLOT, Renderer, Text};
+use render::{Instance, LARGE_BIT, NO_SLOT, Renderer};
+use ui::{Text, theme};
 
 /// Tiles below this many physical pixels show only their thumbhash.
 const SMALL_MIN: f32 = 18.0;
@@ -50,11 +53,14 @@ struct Core {
     last_tick: Instant,
     smooth_scroll: f32,
     velocity: f32,
-    last_text: (String, String, String),
+    /// Physical pixels taken by the sidebar; the grid lives to the right of it.
+    left: f32,
+    /// UI drawn over the grid, rebuilt every frame.
+    ui: ui::Frame,
 }
 
-fn viewport(size: (u32, u32), scale: f32) -> Viewport {
-    Viewport { width: size.0 as f32, height: size.1 as f32, top: 76.0 * scale }
+fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
+    Viewport { width: (size.0 as f32 - left).max(1.0), height: size.1 as f32, top: 76.0 * scale }
 }
 
 impl Core {
@@ -64,7 +70,7 @@ impl Core {
             renderer,
             library: None,
             generation: 0,
-            layout: Layout::new(viewport(size, scale)),
+            layout: Layout::new(viewport(size, scale, 0.0)),
             status: String::new(),
             frame: 1,
             pending: VecDeque::new(),
@@ -74,14 +80,24 @@ impl Core {
             last_tick: Instant::now(),
             smooth_scroll: 0.0,
             velocity: 0.0,
-            last_text: Default::default(),
+            left: 0.0,
+            ui: ui::Frame::default(),
         }
     }
 
     fn resize(&mut self, size: (u32, u32), scale: f32) {
         self.size = size;
         self.scale = scale;
-        self.layout.resize(viewport(size, scale));
+        self.layout.resize(viewport(size, scale, self.left));
+    }
+
+    /// Reserves `left` physical pixels on the left (e.g. for the sidebar).
+    #[allow(dead_code)]
+    fn set_left(&mut self, left: f32) {
+        if (left - self.left).abs() > 0.5 {
+            self.left = left;
+            self.layout.resize(viewport(self.size, self.scale, left));
+        }
     }
 
     fn pump(&mut self) {
@@ -108,6 +124,7 @@ impl Core {
         self.last_tick = now;
         self.frame += 1;
         let frame = self.frame;
+        self.ui.clear();
 
         // Mouse wheels glide to their target; touchpads coast after the fingers lift.
         if self.smooth_scroll.abs() > 0.5 {
@@ -126,7 +143,7 @@ impl Core {
 
         if self.library.is_none() {
             self.instances.clear();
-            self.update_text();
+            self.build_header();
             return false;
         }
         let vp = self.layout.vp;
@@ -191,7 +208,7 @@ impl Core {
                 fading |= fade < 1.0 && slot != NO_SLOT;
                 // Hairline gaps when tiles are big enough to read as photos; a seamless mosaic below.
                 let gap = if size < 40.0 * self.scale { 0.0 } else { (size * 0.012).clamp(1.0, 2.0 * self.scale) };
-                rect = [rect[0] + gap / 2.0, rect[1] + gap / 2.0, rect[2] - gap, rect[3] - gap];
+                rect = [self.left + rect[0] + gap / 2.0, rect[1] + gap / 2.0, rect[2] - gap, rect[3] - gap];
                 self.instances.push(Instance { rect, th: i as u32, slot, fade: ease_out(fade), _pad: 0.0 });
             }
         }
@@ -208,11 +225,12 @@ impl Core {
             self.pending.pop_front();
         }
 
-        self.update_text();
+        self.build_header();
         fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
     }
 
-    fn update_text(&mut self) {
+    /// Title, counts and sync status over the grid's top scrim.
+    fn build_header(&mut self) {
         let (title, subtitle) = match &self.library {
             None => ("Lumen".to_string(), String::new()),
             Some(lib) if lib.len() == 0 => ("Library".to_string(), "No photos yet".to_string()),
@@ -234,17 +252,24 @@ impl Core {
                 }
             }
         };
-        let key = (title, subtitle, self.status.clone());
-        if key != self.last_text {
-            let text = Text { title: key.0.clone(), subtitle: key.1.clone(), status: key.2.clone() };
-            self.renderer.set_text(&text, self.scale, self.size.0 as f32);
-            self.last_text = key;
+        let (s, x) = (self.scale, self.left + 20.0 * self.scale);
+        let base = &mut self.ui.base;
+        base.text(Text::new(title, x, 14.0 * s, 26.0 * s).weight(700).color(theme::TEXT));
+        base.text(Text::new(subtitle, x, 48.0 * s, 13.0 * s).weight(500).color(theme::TEXT_DIM));
+        if !self.status.is_empty() {
+            let right = self.size.0 as f32 - 20.0 * s;
+            base.text(
+                Text::new(self.status.clone(), right, 22.0 * s, 14.0 * s)
+                    .weight(500)
+                    .color(theme::TEXT_DIM)
+                    .align(ui::Align::Right),
+            );
         }
     }
 
     fn draw(&mut self, view: &wgpu::TextureView) {
         let header = self.layout.vp.top;
-        self.renderer.render(view, self.size, header, self.scale, &self.instances);
+        self.renderer.render(view, self.size, header, self.scale, &self.instances, &self.ui);
     }
 }
 
@@ -337,10 +362,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 core.resize(core.size, scale);
-                core.last_text = Default::default();
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x as f32, position.y as f32),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+                window.request_redraw();
+            }
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 let zooming = self.modifiers.control_key() || self.modifiers.super_key();
                 match (delta, zooming) {
@@ -377,7 +404,7 @@ impl ApplicationHandler for App {
                     let steps = self.zoom_accum.trunc() as i32;
                     self.zoom_accum -= steps as f32;
                     core.velocity = 0.0;
-                    core.layout.zoom(steps.signum(), self.cursor.0, self.cursor.1, now);
+                    core.layout.zoom(steps.signum(), self.cursor.0 - core.left, self.cursor.1, now);
                 }
                 window.request_redraw();
             }

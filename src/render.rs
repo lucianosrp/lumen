@@ -1,12 +1,9 @@
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
-};
-
 use crate::library::Library;
+use crate::ui::Frame;
+use crate::ui_render::UiRenderer;
 use crate::loader::Tier;
 
 pub const NO_SLOT: u32 = u32::MAX;
@@ -152,12 +149,6 @@ impl SlotAtlas {
     }
 }
 
-pub struct Text {
-    pub title: String,
-    pub subtitle: String,
-    pub status: String,
-}
-
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -173,13 +164,7 @@ pub struct Renderer {
     pub large: SlotAtlas,
     instances: wgpu::Buffer,
     instance_count: u32,
-
-    font_system: FontSystem,
-    swash: SwashCache,
-    text_viewport: Viewport,
-    text_atlas: TextAtlas,
-    text_renderer: TextRenderer,
-    buffers: [Buffer; 3],
+    pub ui: UiRenderer,
 }
 
 impl Renderer {
@@ -279,13 +264,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let instances = Self::instance_buffer(&device, 4096);
-
-        let mut font_system = FontSystem::new();
-        let cache = Cache::new(&device);
-        let text_viewport = Viewport::new(&device, &cache);
-        let mut text_atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text_renderer = TextRenderer::new(&mut text_atlas, &device, Default::default(), None);
-        let buffers = std::array::from_fn(|_| Buffer::new(&mut font_system, Metrics::new(16.0, 20.0)));
+        let ui = UiRenderer::new(&device, &queue, format, &globals);
 
         Self {
             small: SlotAtlas::new(&device, Tier::Small),
@@ -302,12 +281,7 @@ impl Renderer {
             th_info: [16.0, 512.0, 8192.0, 16.0],
             instances,
             instance_count: 0,
-            font_system,
-            swash: SwashCache::new(),
-            text_viewport,
-            text_atlas,
-            text_renderer,
-            buffers,
+            ui,
         }
     }
 
@@ -381,21 +355,6 @@ impl Renderer {
         true
     }
 
-    pub fn set_text(&mut self, text: &Text, scale: f32, width: f32) {
-        let fs = &mut self.font_system;
-        let specs = [
-            (&text.title, 26.0, Weight::BOLD),
-            (&text.subtitle, 13.0, Weight::MEDIUM),
-            (&text.status, 14.0, Weight::MEDIUM),
-        ];
-        for (buf, (s, size, weight)) in self.buffers.iter_mut().zip(specs) {
-            buf.set_metrics(Metrics::new(size * scale, size * scale * 1.25));
-            buf.set_size(Some(width), None);
-            buf.set_text(s, &Attrs::new().family(Family::SansSerif).weight(weight), Shaping::Advanced, None);
-            buf.shape_until_scroll(fs, false);
-        }
-    }
-
     pub fn render(
         &mut self,
         view: &wgpu::TextureView,
@@ -403,6 +362,7 @@ impl Renderer {
         header: f32,
         scale: f32,
         tiles: &[Instance],
+        frame: &Frame,
     ) {
         let (w, h) = size;
         let g = Globals {
@@ -419,51 +379,7 @@ impl Renderer {
         self.queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(tiles));
         self.instance_count = tiles.len() as u32;
 
-        self.text_viewport.update(&self.queue, Resolution { width: w, height: h });
-        let pad = 20.0 * scale;
-        let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-        let line_w = |b: &Buffer| b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
-        let status_w = line_w(&self.buffers[2]);
-        let areas = [
-            TextArea {
-                buffer: &self.buffers[0],
-                left: pad,
-                top: 14.0 * scale,
-                scale: 1.0,
-                bounds,
-                default_color: Color::rgb(255, 255, 255),
-                custom_glyphs: &[],
-            },
-            TextArea {
-                buffer: &self.buffers[1],
-                left: pad,
-                top: 48.0 * scale,
-                scale: 1.0,
-                bounds,
-                default_color: Color::rgba(255, 255, 255, 165),
-                custom_glyphs: &[],
-            },
-            TextArea {
-                buffer: &self.buffers[2],
-                left: (w as f32 - status_w - pad).max(pad),
-                top: 22.0 * scale,
-                scale: 1.0,
-                bounds,
-                default_color: Color::rgba(255, 255, 255, 190),
-                custom_glyphs: &[],
-            },
-        ];
-        if let Err(e) = self.text_renderer.prepare(
-            &self.device,
-            &self.queue,
-            &mut self.font_system,
-            &mut self.text_atlas,
-            &self.text_viewport,
-            areas,
-            &mut self.swash,
-        ) {
-            log::warn!("text: {e}");
-        }
+        self.ui.prepare(&self.device, &self.queue, frame, size);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -493,9 +409,10 @@ impl Renderer {
                 pass.set_pipeline(&self.header_pipeline);
                 pass.draw(0..4, 0..1);
             }
-            let _ = self.text_renderer.render(&self.text_atlas, &self.text_viewport, &mut pass);
+            self.ui.draw_layer(&mut pass, 0);
+            self.ui.draw_layer(&mut pass, 1);
         }
         self.queue.submit(Some(encoder.finish()));
-        self.text_atlas.trim();
+        self.ui.trim();
     }
 }

@@ -78,7 +78,8 @@ impl Shared {
 pub struct Loader {
     pub rx: Receiver<Msg>,
     shared: Arc<Shared>,
-    _rt: tokio::runtime::Runtime,
+    rt: tokio::runtime::Runtime,
+    source: Source,
 }
 
 const WORKERS: usize = 24;
@@ -96,7 +97,28 @@ impl Loader {
         for _ in 0..WORKERS {
             rt.spawn(worker(source.clone(), shared.clone()));
         }
-        Self { rx, shared, _rt: rt }
+        let source = source.clone();
+        Self { rx, shared, rt, source }
+    }
+
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// Runtime for feature-specific background work (fetch albums, previews, map tiles…).
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
+    }
+
+    /// Call from background work after sending a result, so the UI redraws.
+    pub fn wake(&self) {
+        (self.shared.wake)();
+    }
+
+    /// A clonable, Send waker for moving into spawned tasks.
+    pub fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let shared = self.shared.clone();
+        Arc::new(move || (shared.wake)())
     }
 
     /// Replaces the want list. Jobs already in flight or known to fail are skipped.
@@ -116,7 +138,7 @@ impl Loader {
     }
 }
 
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("lumen")
 }
 
@@ -218,16 +240,7 @@ async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) ->
             image::DynamicImage::ImageRgba8(library::demo_image(index as u64, 256))
         }
         Source::Immich(immich) => {
-            let path = cache_dir().join("thumbs").join(&asset.id);
-            let bytes = match tokio::fs::read(&path).await {
-                Ok(b) => b,
-                Err(_) => {
-                    let b = immich.thumbnail(&asset.id).await?;
-                    let _ = tokio::fs::create_dir_all(path.parent().unwrap()).await;
-                    let _ = tokio::fs::write(&path, &b).await;
-                    b
-                }
-            };
+            let bytes = thumbnail_bytes(immich, &asset.id).await?;
             tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??
         }
     };
@@ -245,6 +258,18 @@ async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) ->
     })
     .await?;
     Ok(mips)
+}
+
+/// An asset's ~250px thumbnail, from the shared disk cache or the server.
+pub async fn thumbnail_bytes(immich: &Immich, id: &str) -> Result<Vec<u8>> {
+    let path = cache_dir().join("thumbs").join(id);
+    if let Ok(b) = tokio::fs::read(&path).await {
+        return Ok(b);
+    }
+    let b = immich.thumbnail(id).await?;
+    let _ = tokio::fs::create_dir_all(path.parent().unwrap()).await;
+    let _ = tokio::fs::write(&path, &b).await;
+    Ok(b)
 }
 
 fn fxhash(s: &str) -> u64 {
