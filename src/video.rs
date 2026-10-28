@@ -13,6 +13,8 @@ use gstreamer_video::prelude::*;
 
 /// Videos shorter than this loop, like Live Photos; longer ones stop at the end.
 const LOOP_UNDER: f64 = 15.0;
+/// Settings → Loop short clips.
+pub static LOOP_SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Initialises GStreamer once; false if it's unusable (the viewer falls back to mpv).
 pub fn available() -> bool {
@@ -245,7 +247,8 @@ impl Player {
                 }
                 M::DurationChanged(_) => self.duration = None,
                 M::Eos(_) => {
-                    if self.duration.is_some_and(|d| d < LOOP_UNDER) && self.want_playing {
+                    let looping = LOOP_SHORT.load(std::sync::atomic::Ordering::Relaxed);
+                    if looping && self.duration.is_some_and(|d| d < LOOP_UNDER) && self.want_playing {
                         self.seek_now(0.0, false);
                     } else {
                         self.ended = true;

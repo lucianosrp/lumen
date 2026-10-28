@@ -5,6 +5,7 @@ struct Globals {
     large: vec4f,
     xl: vec4f,
     xl_size: vec4f, // atlas width, height
+    sizes: vec4f,   // small atlas width, height; large atlas width, height
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -68,9 +69,9 @@ fn fs_tile(v: VOut) -> @location(0) vec4f {
         if (v.slot & 0x40000000u) != 0u {
             img = cell_sample(xl_tex, s, g.xl, g.xl_size.xy, g.xl.w, v.uv, v.size);
         } else if (v.slot & 0x80000000u) != 0u {
-            img = cell_sample(large_tex, s, g.large, vec2f(g.large.z), g.large.w, v.uv, v.size);
+            img = cell_sample(large_tex, s, g.large, g.sizes.zw, g.large.w, v.uv, v.size);
         } else {
-            img = cell_sample(small_tex, s, g.small, vec2f(g.small.z), g.small.w, v.uv, v.size);
+            img = cell_sample(small_tex, s, g.small, g.sizes.xy, g.small.w, v.uv, v.size);
         }
         c = mix(c, img, v.fade);
     }
