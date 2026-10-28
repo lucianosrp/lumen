@@ -11,6 +11,12 @@ pub struct Asset {
     pub video: bool,
     /// Base64 thumbhash, used as the instant placeholder.
     pub thumbhash: Option<String>,
+    /// Live Photo: the id of its motion clip (itself a hidden video asset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_video: Option<String>,
+    /// Video length in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
 }
 
 impl Asset {
@@ -144,6 +150,8 @@ pub fn demo_assets(n: usize) -> Vec<Asset> {
                 ratio: 1.0,
                 video: i % 23 == 0,
                 thumbhash: Some(base64::engine::general_purpose::STANDARD.encode(hash)),
+                live_video: None,
+                duration_ms: (i % 23 == 0).then_some(3_000 + (i as u32 * 7_919) % 600_000),
             }
         })
         .collect()
