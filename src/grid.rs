@@ -3,6 +3,10 @@
 //! A zoom doesn't snap: the previous on-screen state is frozen into a `Spec::Blend` and every
 //! tile interpolates from where it was to where it's going. Zooming again mid-animation nests
 //! blends, so rapid pinches stay continuous.
+//!
+//! A touchpad pinch scales the grid continuously around the fingers (`Spec::Scaled`); each time
+//! the scale reaches the next column count the tiles reflow into it, and on release the grid
+//! settles on the nearest level.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -17,6 +21,8 @@ pub struct Grid {
 pub enum Spec {
     Grid(Grid),
     Blend(Box<Spec>, Box<Spec>, f32),
+    /// Uniform scale around an anchor point (grid-local px).
+    Scaled(Box<Spec>, [f32; 2], f32),
 }
 
 #[derive(Clone, Copy)]
@@ -38,10 +44,11 @@ impl Grid {
         [col as f32 * t, row as f32 * t - self.scroll, t, t]
     }
 
-    fn range(&self, n: usize, vp: &Viewport, margin: f32) -> Range<usize> {
+    /// Indices whose rows overlap screen rows `y0..y1`.
+    fn range(&self, n: usize, vp: &Viewport, y0: f32, y1: f32) -> Range<usize> {
         let t = self.tile(vp);
-        let first = ((self.scroll - margin) / t).floor().max(0.0) as usize;
-        let last = ((self.scroll + vp.height + margin) / t).ceil().max(0.0) as usize;
+        let first = ((self.scroll + y0) / t).floor().max(0.0) as usize;
+        let last = ((self.scroll + y1) / t).ceil().max(0.0) as usize;
         let c = self.cols as usize;
         (first * c).min(n)..((last + 1) * c).min(n)
     }
@@ -70,16 +77,21 @@ impl Spec {
                 let (a, b) = (a.rect(i, vp), b.rect(i, vp));
                 std::array::from_fn(|k| a[k] + (b[k] - a[k]) * t)
             }
+            Spec::Scaled(inner, [ax, ay], s) => {
+                let r = inner.rect(i, vp);
+                [ax + (r[0] - ax) * s, ay + (r[1] - ay) * s, r[2] * s, r[3] * s]
+            }
         }
     }
 
-    fn ranges(&self, n: usize, vp: &Viewport, margin: f32, out: &mut Vec<Range<usize>>) {
+    fn ranges(&self, n: usize, vp: &Viewport, y0: f32, y1: f32, out: &mut Vec<Range<usize>>) {
         match self {
-            Spec::Grid(g) => out.push(g.range(n, vp, margin)),
+            Spec::Grid(g) => out.push(g.range(n, vp, y0, y1)),
             Spec::Blend(a, b, _) => {
-                a.ranges(n, vp, margin, out);
-                b.ranges(n, vp, margin, out);
+                a.ranges(n, vp, y0, y1, out);
+                b.ranges(n, vp, y0, y1, out);
             }
+            Spec::Scaled(inner, [_, ay], s) => inner.ranges(n, vp, ay + (y0 - ay) / s, ay + (y1 - ay) / s, out),
         }
     }
 
@@ -90,6 +102,7 @@ impl Spec {
                 a.scroll_by(dy);
                 b.scroll_by(dy);
             }
+            Spec::Scaled(inner, _, s) => inner.scroll_by(dy / *s),
         }
     }
 
@@ -98,6 +111,7 @@ impl Spec {
         match self {
             Spec::Blend(_, b, _) if depth == 0 => *b,
             Spec::Blend(a, b, t) => Spec::Blend(Box::new(a.prune(depth - 1)), b, t),
+            Spec::Scaled(inner, a, s) => Spec::Scaled(Box::new(inner.prune(depth)), a, s),
             g => g,
         }
     }
@@ -110,6 +124,8 @@ pub struct Layout {
     from: Option<(Spec, Instant)>,
     levels: Vec<u32>,
     pub level: usize,
+    /// Active touchpad pinch: anchor (grid-local px) and scale relative to `target`.
+    pinch: Option<([f32; 2], f32)>,
 }
 
 const ZOOM_TIME: Duration = Duration::from_millis(340);
@@ -122,7 +138,7 @@ fn ease(t: f32) -> f32 {
 
 impl Layout {
     pub fn new(vp: Viewport) -> Self {
-        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0 }, from: None, levels: vec![5], level: 0 }
+        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0 }, from: None, levels: vec![5], level: 0, pinch: None }
     }
 
     /// Columns at which the whole library fits on one screen.
@@ -209,11 +225,72 @@ impl Layout {
     }
 
     pub fn zoom_to(&mut self, level: usize, ax: f32, ay: f32, now: Instant) {
-        if level == self.level || self.n == 0 {
+        if level == self.level || self.n == 0 || self.pinch.is_some() {
             return;
         }
-        let anchor = self.index_at(ax, ay);
         let current = self.current(now);
+        self.set_level(level, ax, ay);
+        self.from = Some((current.prune(3), now));
+    }
+
+    pub fn pinch_begin(&mut self, ax: f32, ay: f32) {
+        if self.n > 0 {
+            self.pinch = Some(([ax, ay], 1.0));
+        }
+    }
+
+    /// Fingers moved: `ratio` is the change in finger distance since the last update.
+    pub fn pinch_update(&mut self, ratio: f32, now: Instant) {
+        let Some(([ax, ay], mut s)) = self.pinch else { return };
+        s *= ratio;
+        // Each time the tiles reach the next level's size, reflow into it and keep going.
+        while s > 1.0 && self.level > 0 && s >= self.step(self.level - 1) {
+            s /= self.step(self.level - 1);
+            self.reflow(self.level - 1, ax, ay, s, now);
+        }
+        while s < 1.0 && self.level + 1 < self.levels.len() && s <= 1.0 / self.step(self.level) {
+            s *= self.step(self.level);
+            self.reflow(self.level + 1, ax, ay, s, now);
+        }
+        // Rubber-band past the first and last levels.
+        self.pinch = Some(([ax, ay], s.clamp(0.8, 1.4)));
+    }
+
+    /// Fingers lifted: settle on whichever level is nearest.
+    pub fn pinch_end(&mut self, now: Instant) {
+        let Some(([ax, ay], s)) = self.pinch else { return };
+        let current = self.current(now);
+        self.pinch = None;
+        let ln = s.ln();
+        let level = if self.level > 0 && ln > 0.5 * self.step(self.level - 1).ln() {
+            self.level - 1
+        } else if self.level + 1 < self.levels.len() && -ln > 0.5 * self.step(self.level).ln() {
+            self.level + 1
+        } else {
+            self.level
+        };
+        if level != self.level {
+            self.set_level(level, ax, ay);
+        }
+        self.from = Some((current.prune(3), now));
+    }
+
+    /// Size ratio between `level` and the next, more zoomed-out level.
+    fn step(&self, level: usize) -> f32 {
+        self.levels[level + 1] as f32 / self.levels[level] as f32
+    }
+
+    /// Mid-pinch switch to `level`, already scaled by `s` so tile sizes don't jump.
+    fn reflow(&mut self, level: usize, ax: f32, ay: f32, s: f32, now: Instant) {
+        let current = self.current(now);
+        self.set_level(level, ax, ay);
+        self.pinch = Some(([ax, ay], s));
+        self.from = Some((current.prune(3), now));
+    }
+
+    /// Switches column count keeping the tile under (ax, ay) in place.
+    fn set_level(&mut self, level: usize, ax: f32, ay: f32) {
+        let anchor = self.index_at(ax, ay);
         self.level = level;
         self.target.cols = self.levels[level];
         if let Some((i, _, fy)) = anchor {
@@ -221,7 +298,6 @@ impl Layout {
             self.target.scroll = (i as u32 / self.target.cols) as f32 * t + fy * t - ay;
         }
         self.target.clamp(self.n, &self.vp);
-        self.from = Some((current.prune(3), now));
     }
 
     pub fn scroll_by(&mut self, dy: f32) {
@@ -240,24 +316,32 @@ impl Layout {
     }
 
     pub fn animating(&self, now: Instant) -> bool {
+        self.pinch.is_some() || self.blending(now)
+    }
+
+    fn blending(&self, now: Instant) -> bool {
         self.from.as_ref().is_some_and(|(_, t)| now.duration_since(*t) < ZOOM_TIME)
     }
 
     /// What's on screen right now.
     pub fn current(&self, now: Instant) -> Spec {
+        let target = match self.pinch {
+            Some((anchor, s)) => Spec::Scaled(Box::new(Spec::Grid(self.target)), anchor, s),
+            None => Spec::Grid(self.target),
+        };
         match &self.from {
-            Some((from, start)) if self.animating(now) => {
+            Some((from, start)) if self.blending(now) => {
                 let t = ease(now.duration_since(*start).as_secs_f32() / ZOOM_TIME.as_secs_f32());
-                Spec::Blend(Box::new(from.clone()), Box::new(Spec::Grid(self.target)), t)
+                Spec::Blend(Box::new(from.clone()), Box::new(target), t)
             }
-            _ => Spec::Grid(self.target),
+            _ => target,
         }
     }
 
     /// Sorted, merged index ranges that may be visible in `spec`, `margin` px beyond the edges.
     pub fn visible(&self, spec: &Spec, margin: f32) -> Vec<Range<usize>> {
         let mut rs = Vec::new();
-        spec.ranges(self.n, &self.vp, margin, &mut rs);
+        spec.ranges(self.n, &self.vp, -margin, self.vp.height + margin, &mut rs);
         rs.sort_by_key(|r| r.start);
         let mut out: Vec<Range<usize>> = Vec::new();
         for r in rs.into_iter().filter(|r| !r.is_empty()) {

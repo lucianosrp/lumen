@@ -411,16 +411,13 @@ struct App {
     zoom_accum: f32,
     last_pixel_scroll: Option<(Instant, f32)>,
     pinch: Option<Receiver<gestures::Pinch>>,
-    /// ln(scale) already turned into zoom steps during the current pinch.
-    pinch_applied: f64,
     /// Cumulative scale at the previous pinch update, for continuous zooms.
     pinch_last: f64,
     /// Where the left button went down, to tell clicks from drags.
     press: Option<(f32, f32)>,
 }
 
-/// Finger-distance change (as a ratio) per grid zoom level.
-const PINCH_STEP: f64 = 1.3;
+
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -470,10 +467,15 @@ impl ApplicationHandler for App {
     fn user_event(&mut self, _: &ActiveEventLoop, _: ()) {
         if let (Some(rx), Some(core)) = (&self.pinch, &mut self.core) {
             let now = Instant::now();
-            let step = PINCH_STEP.ln();
             while let Ok(p) = rx.try_recv() {
                 match p {
-                    gestures::Pinch::Begin => (self.pinch_applied, self.pinch_last) = (0.0, 1.0),
+                    gestures::Pinch::Begin => {
+                        self.pinch_last = 1.0;
+                        if !core.viewer.is_open() && core.map.is_none() {
+                            core.velocity = 0.0;
+                            core.layout.pinch_begin(self.cursor.0 - core.left, self.cursor.1);
+                        }
+                    }
                     // The viewer and the map zoom continuously, following the fingers.
                     gestures::Pinch::Update { scale } if scale > 0.0 && (core.viewer.is_open() || core.map.is_some()) => {
                         let ratio = scale / self.pinch_last;
@@ -481,26 +483,17 @@ impl ApplicationHandler for App {
                         if core.viewer.is_open() {
                             core.viewer.pinch(ratio as f32, self.cursor);
                         } else if let Some(map) = &mut core.map {
-                            // SAFETY: dummy ids are meant for synthesized events like this one.
-                            let device_id = unsafe { winit::event::DeviceId::dummy() };
+                            let device_id = winit::event::DeviceId::dummy();
                             let ev = WindowEvent::PinchGesture { device_id, delta: ratio - 1.0, phase: TouchPhase::Moved };
                             map.event(&ev, self.modifiers, now);
                         }
                     }
                     gestures::Pinch::Update { scale } if scale > 0.0 => {
-                        let l = scale.ln();
-                        let (ax, ay) = (self.cursor.0 - core.left, self.cursor.1);
-                        while l - self.pinch_applied > step {
-                            core.velocity = 0.0;
-                            core.layout.zoom(-1, ax, ay, now);
-                            self.pinch_applied += step;
-                        }
-                        while l - self.pinch_applied < -step {
-                            core.velocity = 0.0;
-                            core.layout.zoom(1, ax, ay, now);
-                            self.pinch_applied -= step;
-                        }
+                        let ratio = scale / self.pinch_last;
+                        self.pinch_last = scale;
+                        core.layout.pinch_update(ratio as f32, now);
                     }
+                    gestures::Pinch::End => core.layout.pinch_end(now),
                     _ => {}
                 }
             }
@@ -716,6 +709,8 @@ struct Shot {
     sidebar: bool,
     viewer: Option<viewer::Shot>,
     map: Option<map::Shot>,
+    /// Simulated touchpad pinch: final scale, and whether the fingers lift.
+    pinch: Option<(f32, bool)>,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -809,6 +804,22 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
         core.update(Instant::now());
     }
 
+    if let Some((scale, end)) = shot.pinch {
+        // Thirty finger updates over ~half a second, like a real gesture.
+        core.layout.pinch_begin(cx, cy);
+        for _ in 0..30 {
+            core.layout.pinch_update(scale.powf(1.0 / 30.0), Instant::now());
+            std::thread::sleep(Duration::from_millis(16));
+            core.pump();
+            core.update(Instant::now());
+        }
+        if end {
+            core.layout.pinch_end(Instant::now());
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        core.pump();
+        core.update(Instant::now());
+    }
     let device = &core.renderer.device;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -900,6 +911,10 @@ fn main() -> Result<()> {
                 close_at: flag("--close-at").and_then(|s| s.parse().ok()),
             }),
             map: map::Shot::parse(&args),
+            pinch: flag("--pinch").and_then(|s| {
+                let (v, end) = s.strip_suffix(",end").map_or((s.as_str(), false), |v| (v, true));
+                Some((v.parse().ok()?, end))
+            }),
         };
         return screenshot(source, &path, size, scale, shot);
     }
@@ -916,7 +931,6 @@ fn main() -> Result<()> {
         zoom_accum: 0.0,
         last_pixel_scroll: None,
         pinch: None,
-        pinch_applied: 0.0,
         pinch_last: 1.0,
         press: None,
     };

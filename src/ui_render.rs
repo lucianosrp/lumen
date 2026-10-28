@@ -144,7 +144,7 @@ impl UiRenderer {
             cache: None,
         });
 
-        let mut font_system = FontSystem::new();
+        let font_system = FontSystem::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
