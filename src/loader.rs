@@ -76,6 +76,11 @@ pub struct Collection {
 }
 
 const LIBRARY_QUERY: &str = "visibility=timeline";
+const FAVORITES_QUERY: &str = "visibility=timeline&isFavorite=true";
+const ARCHIVE_QUERY: &str = "visibility=archive";
+const TRASH_QUERY: &str = "isTrashed=true";
+/// Timelines whose membership follows from an asset's favorite/archive/trash state alone.
+const KNOWN_QUERIES: [&str; 4] = [LIBRARY_QUERY, FAVORITES_QUERY, ARCHIVE_QUERY, TRASH_QUERY];
 
 impl Collection {
     fn new(key: impl Into<String>, title: impl Into<String>, query: impl Into<String>, filter: Filter) -> Self {
@@ -85,16 +90,16 @@ impl Collection {
         Self::new("library", "Library", LIBRARY_QUERY, Filter::All)
     }
     pub fn favorites() -> Self {
-        Self::new("favorites", "Favorites", "visibility=timeline&isFavorite=true", Filter::All)
+        Self::new("favorites", "Favorites", FAVORITES_QUERY, Filter::All)
     }
     pub fn videos() -> Self {
         Self::new("videos", "Videos", LIBRARY_QUERY, Filter::VideosOnly)
     }
     pub fn archive() -> Self {
-        Self::new("archive", "Archive", "visibility=archive", Filter::All)
+        Self::new("archive", "Archive", ARCHIVE_QUERY, Filter::All)
     }
     pub fn trash() -> Self {
-        Self::new("trash", "Recently Deleted", "isTrashed=true", Filter::All)
+        Self::new("trash", "Recently Deleted", TRASH_QUERY, Filter::All)
     }
     pub fn album(id: &str, name: &str) -> Self {
         Self::new(format!("album:{id}"), name, format!("albumId={id}"), Filter::All)
@@ -106,6 +111,15 @@ impl Collection {
     #[allow(dead_code)]
     pub fn ids(key: &str, title: &str, ids: HashSet<String>) -> Self {
         Self::new(key, title, LIBRARY_QUERY, Filter::Ids(Arc::new(ids)))
+    }
+
+    /// Whether this collection's filter lets `a` in (its query is the server's business).
+    pub fn admits(&self, a: &Asset) -> bool {
+        match &self.filter {
+            Filter::All => true,
+            Filter::VideosOnly => a.video,
+            Filter::Ids(ids) => ids.contains(&a.id),
+        }
     }
 
     fn apply(&self, assets: &[Asset]) -> Vec<Asset> {
@@ -135,6 +149,8 @@ struct Shared {
     fresh: Mutex<HashMap<String, (Instant, Arc<Vec<Asset>>)>>,
     tx: Mutex<Sender<Msg>>,
     wake: Box<dyn Fn() + Send + Sync>,
+    /// Cache patches still writing.
+    patching: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -164,6 +180,7 @@ impl Loader {
             fresh: Mutex::default(),
             tx: Mutex::new(tx),
             wake: Box::new(wake),
+            patching: Default::default(),
         });
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         for _ in 0..WORKERS {
@@ -237,9 +254,79 @@ impl Loader {
         want.extend(wants.into_iter().filter(|j| !inflight.contains(j) && !failed.contains(j)));
     }
 
+    /// Makes a locally edited library (see `Library::edit`) current, as if a sync had published
+    /// it, and returns its generation. Old want lists and failures referred to old indices.
+    pub fn adopt(&self, library: Arc<Library>) -> u64 {
+        let mut q = self.shared.queue.lock().unwrap();
+        q.generation += 1;
+        q.library = Some(library);
+        q.want.clear();
+        q.failed.clear();
+        q.generation
+    }
+
+    /// Applies a confirmed change to every cached timeline: `edit` gets each one's query and
+    /// assets (in memory and on disk) and says what to do with them. Forgotten timelines are
+    /// asked of the server on their next open; their disk copy only shows until that sync lands.
+    /// Runs in the background: the library's cache file is megabytes of JSON.
+    pub fn patch_caches(&self, edit: impl Fn(&str, &[Asset]) -> Patch + Send + 'static) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (shared, source) = (self.shared.clone(), self.source.clone());
+        shared.patching.fetch_add(1, SeqCst);
+        self.rt.spawn_blocking(move || {
+            patch_caches(&shared, &source, edit);
+            shared.patching.fetch_sub(1, SeqCst);
+        });
+    }
+}
+
+fn patch_caches(shared: &Shared, source: &Source, edit: impl Fn(&str, &[Asset]) -> Patch) {
+    let mut fresh = shared.fresh.lock().unwrap();
+    let mut queries: Vec<String> = fresh.keys().cloned().collect();
+    for q in KNOWN_QUERIES {
+        if !queries.iter().any(|k| k == q) {
+            queries.push(q.to_string());
+        }
+    }
+    for query in queries {
+        let path = match source {
+            Source::Immich(immich) => Some(library_cache_path(immich, &query)),
+            Source::Demo(_) => None,
+        };
+        let mem = fresh.get(&query).map(|f| f.1.clone());
+        let disk = || -> Option<Vec<Asset>> { serde_json::from_slice(&std::fs::read(path.as_ref()?).ok()?).ok() };
+        let Some(current) = mem.as_deref().cloned().or_else(disk) else { continue };
+        match edit(&query, &current) {
+            Patch::Keep => {}
+            Patch::Replace(mut assets) => {
+                assets.sort_by(|a, b| a.taken.cmp(&b.taken));
+                if let Some(path) = &path
+                    && path.exists()
+                {
+                    let _ = std::fs::write(path, serde_json::to_vec(&assets).unwrap());
+                }
+                if mem.is_some() {
+                    fresh.insert(query, (Instant::now(), Arc::new(assets)));
+                }
+            }
+            Patch::Forget => {
+                fresh.remove(&query);
+            }
+        }
+    }
+}
+
+/// What `Loader::patch_caches` does with one cached timeline.
+pub enum Patch {
+    Keep,
+    Forget,
+    Replace(Vec<Asset>),
+}
+
+impl Loader {
     pub fn is_idle(&self) -> bool {
         let q = self.shared.queue.lock().unwrap();
-        q.want.is_empty() && q.inflight.is_empty() && !q.syncing
+        q.want.is_empty() && q.inflight.is_empty() && !q.syncing && self.shared.patching.load(std::sync::atomic::Ordering::SeqCst) == 0
     }
 }
 

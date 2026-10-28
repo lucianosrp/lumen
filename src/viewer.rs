@@ -213,6 +213,8 @@ struct Open {
     live_held: bool,
     /// The mouse was over the LIVE pill last frame.
     over_live: bool,
+    /// Last frame's chrome opacity.
+    ca: f32,
 }
 
 pub struct Viewer {
@@ -240,6 +242,8 @@ pub struct Viewer {
     live: Option<Clip>,
     /// Play the motion on the next update: Some(true) toggles, Some(false) only starts.
     live_request: Option<bool>,
+    /// Physical pixels left of the info button kept free for other buttons (photo actions).
+    pub toolbar_width: f32,
 }
 
 /// What headless screenshot mode should show.
@@ -298,6 +302,7 @@ impl Viewer {
             play_request: None,
             live: None,
             live_request: None,
+            toolbar_width: 0.0,
         }
     }
 
@@ -336,7 +341,23 @@ impl Viewer {
             press_at: None,
             live_held: false,
             over_live: false,
+            ca: 0.0,
         });
+    }
+
+    /// The library and index on screen, unless the viewer is closed or closing.
+    pub fn current(&self) -> Option<(&Arc<Library>, usize)> {
+        self.open.as_ref().filter(|o| !matches!(o.phase, Phase::Closing { .. })).map(|o| (&o.lib, o.index))
+    }
+
+    /// Opacity of the chrome (top bar) last frame, 0 when hidden.
+    pub fn chrome(&self) -> f32 {
+        self.current().and(self.open.as_ref()).map_or(0.0, |o| o.ca)
+    }
+
+    /// The visible part of the photo last frame.
+    pub fn photo(&self) -> Option<[f32; 4]> {
+        self.current().and(self.open.as_ref()).map(|o| o.clip)
     }
 
     /// Opens the tile under a click at physical (x, y). Returns true if one was hit.
@@ -881,6 +902,13 @@ impl Viewer {
                     o.slide = None;
                     o.reveal = true;
                 }
+                // Gone (trashed, archived…): carry on with its neighbour, like Photos does.
+                None if !matches!(o.phase, Phase::Closing { .. }) && let Some(i) = successor(&o.lib, o.index, lib) => {
+                    o.lib = lib.clone();
+                    o.index = i;
+                    (o.slide, o.zoom, o.zoom_s, o.pan, o.pan_s) = (None, 1.0, 1.0, [0.0; 2], [0.0; 2]);
+                    o.reveal = true;
+                }
                 None => {
                     o.phase = match o.phase {
                         Phase::Closing { start, img, clip, .. } => Phase::Closing { start, img, clip, to_tile: false },
@@ -1250,6 +1278,7 @@ impl Viewer {
         busy |= target > 0.0 && !held;
         o.hits.clear();
         let ca = o.chrome * progress;
+        o.ca = ca;
         if ca > 0.003 {
             let details = self.slots.get(&asset.id).and_then(|s| s.info.as_ref());
             self.draw_chrome(o, details, ca, s, out);
@@ -1459,7 +1488,7 @@ impl Viewer {
             (None, None) => (d.original_file_name.clone().unwrap_or_default(), String::new()),
         };
         let x = 64.0 * s;
-        let max = (w - x - 80.0 * s).max(50.0);
+        let max = (w - x - 80.0 * s - self.toolbar_width).max(50.0);
         out.text(Text::new(title, x, 15.0 * s, 16.0 * s).weight(600).max_width(max).color(fade_color(theme::TEXT, ca)));
         out.text(Text::new(subtitle, x, 36.0 * s, 13.0 * s).weight(500).max_width(max).color(fade_color(theme::TEXT_DIM, ca)));
     }
@@ -1712,6 +1741,12 @@ fn decode_thumbhash(hash: Option<&str>) -> Option<(u32, u32, Vec<u8>)> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(hash?).ok()?;
     let (w, h, rgba) = thumbhash::thumb_hash_to_rgba(&bytes).ok()?;
     Some((w as u32, h as u32, rgba))
+}
+
+/// The photo after `old[i]` (else before it) that's still in `new`.
+fn successor(old: &Library, i: usize, new: &Library) -> Option<usize> {
+    let at: HashMap<&str, usize> = new.assets.iter().enumerate().map(|(j, a)| (a.id.as_str(), j)).collect();
+    (i + 1..old.len()).chain((0..i).rev()).find_map(|k| at.get(old.assets[k].id.as_str()).copied())
 }
 
 /// Scrolls the grid so tile `i` is comfortably on screen.

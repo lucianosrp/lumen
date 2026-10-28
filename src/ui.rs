@@ -1,7 +1,8 @@
 //! Immediate-mode drawing list for everything that isn't the photo grid.
 //!
 //! Each frame, features push rounded rects, images and text into a `Frame`; the renderer
-//! draws `base` over the grid, then `overlay` on top of everything (viewer, popovers).
+//! draws `base` over the grid, then `overlay` (viewer), then `popup` on top of everything
+//! (menus, sheets, toasts), so a popover's text never shows through from a layer below.
 //! All coordinates are physical pixels, origin top-left.
 
 pub type ImageId = u64;
@@ -123,12 +124,14 @@ impl Layer {
 pub struct Frame {
     pub base: Layer,
     pub overlay: Layer,
+    pub popup: Layer,
 }
 
 impl Frame {
     pub fn clear(&mut self) {
         self.base.clear();
         self.overlay.clear();
+        self.popup.clear();
     }
 }
 

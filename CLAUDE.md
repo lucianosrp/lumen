@@ -9,7 +9,11 @@ glyphon (text), GStreamer (video). Config: `~/.config/lumen/config.json` (`url`,
 - `render.rs`: thumbnail atlases by tier (small 64 / large 256 / xl 1024 px) plus a mipmapped thumbhash atlas
 - `loader.rs`: library sync by collection (`Collection`, `Loader::open`), thumbnail workers fed by a priority want-list, disk caches in `~/.cache/lumen/`
 - `ui.rs` / `ui_render.rs` / `ui.wgsl`: immediate-mode draw list (`Frame { base, overlay }` of quads, images and text)
-- `sidebar.rs`, `viewer.rs`, `video.rs`, `map.rs` (Places), `gestures.rs` (Wayland pinch; remove once on winit 0.31)
+- `sidebar.rs`, `viewer.rs`, `video.rs` (GStreamer), `map.rs` (Places), `gestures.rs` (Wayland pinch; remove once on winit 0.31)
+- `actions.rs`: selection, favorite, archive, trash/restore, add-to-album, context menus, toasts with undo. Optimistic edits go through `Library::edit` and `Renderer::remap_library`
+- `hover.rs`: hover-to-play previews and badges. `live.rs`: Immich socket.io push events lead to `Loader::refresh`
+- `settings.rs` / `settings_ui.rs` / `widgets.rs` / `storage.rs`: preferences (`~/.config/lumen/settings.json`), the Settings page, reusable controls, cache sizes and limits
+- UI layers draw `base`, then `overlay` (viewer), then `popup` (menus, sheets, toasts)
 
 ## Working on it
 - Build: `cargo build --release`. Don't build debug or add more target dirs; the user cares about disk usage.

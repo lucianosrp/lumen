@@ -18,8 +18,12 @@ pub struct Instance {
     pub th: u32,
     pub slot: u32,
     pub fade: f32,
-    pub _pad: f32,
+    /// `SELECTED_BIT`, plus how far the tile has faded out (`LEAVING_SHIFT`, 0..255).
+    pub flags: u32,
 }
+
+pub const SELECTED_BIT: u32 = 1;
+pub const LEAVING_SHIFT: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -120,6 +124,25 @@ impl SlotAtlas {
         self.owner.fill(usize::MAX);
         self.free = (0..self.capacity() as u32).rev().collect();
         self.slot_of = vec![NO_SLOT; n];
+        self.evict.clear();
+    }
+
+    /// Follows a local library edit: thumbnails stay loaded under their assets' new indices.
+    fn remap(&mut self, map: &[Option<usize>], n: usize) {
+        let mut slot_of = vec![NO_SLOT; n];
+        for (old, &s) in self.slot_of.iter().enumerate().filter(|(_, s)| **s != NO_SLOT) {
+            match map.get(old).copied().flatten() {
+                Some(j) => {
+                    slot_of[j] = s;
+                    self.owner[s as usize] = j;
+                }
+                None => {
+                    self.owner[s as usize] = usize::MAX;
+                    self.free.push(s);
+                }
+            }
+        }
+        self.slot_of = slot_of;
         self.evict.clear();
     }
 
@@ -292,7 +315,7 @@ impl Renderer {
             &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Instance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Uint32, 2 => Uint32, 3 => Float32],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Uint32, 2 => Uint32, 3 => Float32, 4 => Uint32],
             })],
             None,
         );
@@ -347,6 +370,23 @@ impl Renderer {
     }
 
     pub fn set_library(&mut self, lib: &Library) {
+        self.upload_thumbhashes(lib);
+        self.small.reset(lib.len());
+        self.large.reset(lib.len());
+        self.xl.reset(lib.len());
+        self.rebind();
+    }
+
+    /// Swaps in an edited copy of the library (see `Library::edit`) without dropping thumbnails.
+    pub fn remap_library(&mut self, lib: &Library, map: &[Option<usize>]) {
+        self.upload_thumbhashes(lib);
+        self.small.remap(map, lib.len());
+        self.large.remap(map, lib.len());
+        self.xl.remap(map, lib.len());
+        self.rebind();
+    }
+
+    fn upload_thumbhashes(&mut self, lib: &Library) {
         let th = &lib.thumbhashes;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("thumbhash atlas"),
@@ -374,11 +414,8 @@ impl Renderer {
         }
         self.th_info = [th.cell as f32, th.cols as f32, th.width as f32, th.height as f32];
         self.th_view = Some(tex.create_view(&Default::default()));
-        self.small.reset(lib.len());
-        self.large.reset(lib.len());
-        self.xl.reset(lib.len());
-        self.rebind();
     }
+
 
     /// Recreates the thumbnail atlases for a new memory budget; what they held reloads.
     pub fn set_gpu_memory(&mut self, mem: GpuMemory) {
@@ -500,6 +537,7 @@ impl Renderer {
             }
             self.ui.draw_layer(&mut pass, 0);
             self.ui.draw_layer(&mut pass, 1);
+            self.ui.draw_layer(&mut pass, 2);
         }
         self.queue.submit(Some(encoder.finish()));
         self.ui.trim();
