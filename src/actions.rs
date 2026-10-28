@@ -97,7 +97,7 @@ fn member(key: &str, s: State) -> Option<bool> {
         "archive" => Some(!s.trashed && s.archived),
         "favorites" => Some(timeline && s.favorite),
         "library" | "videos" => Some(timeline),
-        k if k.starts_with("place:") => Some(timeline),
+        k if k.starts_with("place:") || k.starts_with("search:") => Some(timeline),
         _ if s.trashed => Some(false),
         _ => None,
     }
@@ -210,7 +210,7 @@ struct Menu {
 
 struct Picker {
     targets: Vec<Asset>,
-    text: String,
+    field: crate::widgets::TextField,
     /// Logical pixels.
     scroll: f32,
     /// Highlighted row: 0 is "New Album…", then the albums matching `text`.
@@ -288,6 +288,11 @@ impl Actions {
     /// No request is waiting for the server.
     pub fn is_idle(&self) -> bool {
         self.ops.is_empty() && self.leaving.is_none()
+    }
+
+    /// A menu or the album picker is open (it owns the keyboard and outside clicks).
+    pub fn popup_open(&self) -> bool {
+        self.menu.is_some() || self.picker.is_some()
     }
 
     pub fn toast_text(&self) -> Option<&str> {
@@ -753,7 +758,7 @@ fn open_tile_menu(core: &mut Core, i: usize, at: (f32, f32)) {
 
 fn open_picker(core: &mut Core, targets: Vec<Asset>) {
     core.actions.menu = None;
-    core.actions.picker = Some(Picker { targets, text: String::new(), scroll: 0.0, sel: None });
+    core.actions.picker = Some(Picker { targets, field: Default::default(), scroll: 0.0, sel: None });
 }
 
 /// Albums matching the picker's text: (id, name, count).
@@ -765,10 +770,10 @@ fn picker_albums(core: &Core, text: &str) -> Vec<(String, String, usize)> {
 fn choose_row(core: &mut Core, row: usize) {
     let Some(p) = core.actions.picker.take() else { return };
     if row == 0 {
-        let name = p.text.trim();
+        let name = p.field.text.trim();
         let name = if name.is_empty() { "Untitled Album".to_string() } else { name.to_string() };
         perform(core, Kind::NewAlbum(name), p.targets, None, true);
-    } else if let Some((id, name, _)) = picker_albums(core, &p.text).into_iter().nth(row - 1) {
+    } else if let Some((id, name, _)) = picker_albums(core, &p.field.text).into_iter().nth(row - 1) {
         perform(core, Kind::Album { id, name }, p.targets, None, true);
     }
 }
@@ -985,7 +990,7 @@ fn shortcut(core: &mut Core, key: &Key, mods: ModifiersState) -> bool {
 }
 
 fn picker_key(core: &mut Core, event: &winit::event::KeyEvent, mods: ModifiersState) {
-    let rows = core.actions.picker.as_ref().map_or(0, |p| picker_albums(core, &p.text).len() + 1);
+    let rows = core.actions.picker.as_ref().map_or(0, |p| picker_albums(core, &p.field.text).len() + 1);
     let Some(p) = &mut core.actions.picker else { return };
     match &event.logical_key {
         Key::Named(NamedKey::Escape) => core.actions.picker = None,
@@ -996,26 +1001,17 @@ fn picker_key(core: &mut Core, event: &winit::event::KeyEvent, mods: ModifiersSt
         }
         Key::Named(NamedKey::ArrowDown) => p.sel = Some(p.sel.map_or(0, |r| (r + 1).min(rows - 1))),
         Key::Named(NamedKey::ArrowUp) => p.sel = Some(p.sel.map_or(0, |r| r.saturating_sub(1))),
-        Key::Named(NamedKey::Backspace) => {
-            p.text.pop();
-            retarget(core);
-        }
-        _ if !mods.control_key() => {
-            if let Some(t) = &event.text {
-                let t: String = t.chars().filter(|c| !c.is_control()).collect();
-                if !t.is_empty() {
-                    p.text.push_str(&t);
-                    retarget(core);
-                }
+        _ => {
+            if p.field.key(event, mods) == crate::widgets::Edit::Changed {
+                retarget(core);
             }
         }
-        _ => {}
     }
 }
 
 /// After typing: highlight the album named exactly that, else the first match, else "New Album".
 fn retarget(core: &mut Core) {
-    let Some(text) = core.actions.picker.as_ref().map(|p| p.text.clone()) else { return };
+    let Some(text) = core.actions.picker.as_ref().map(|p| p.field.text.clone()) else { return };
     let albums = picker_albums(core, &text);
     let t = text.trim().to_lowercase();
     let sel = if t.is_empty() {
@@ -1286,8 +1282,8 @@ fn draw_picker(core: &mut Core, out: &mut Layer) {
     let s = core.scale;
     let (w, h) = (core.size.0 as f32, core.size.1 as f32);
     let Some(p) = &core.actions.picker else { return };
-    let albums = picker_albums(core, &p.text);
-    let (text, sel, targets) = (p.text.clone(), p.sel, noun(p.targets.iter()));
+    let albums = picker_albums(core, &p.field.text);
+    let (text, sel, targets) = (p.field.text.clone(), p.sel, noun(p.targets.iter()));
     let (sw, sh) = (440.0 * s, (560.0 * s).min(h - 80.0 * s));
     let (x, y) = ((w - sw) / 2.0, (h - sh) / 2.0);
     let sheet = [x, y, sw, sh];
@@ -1302,19 +1298,15 @@ fn draw_picker(core: &mut Core, out: &mut Layer) {
 
     let field = [x + 16.0 * s, y + 66.0 * s, sw - 32.0 * s, 34.0 * s];
     out.quad(Quad::solid(field, rgb(pal.shade(pal.raised, 0.08), 1.0), 8.0 * s));
-    let fs = 14.0 * s;
-    let ty = field[1] + field[3] / 2.0 - fs * 0.625;
     let px = crate::widgets::even_with(field[3], 15.0 * s);
     let c = [(field[0] + 12.0 * s + px / 2.0).round(), (field[1] + field[3] / 2.0).round()];
     out.icon_styled("search", c, px, rgb(pal.muted, 0.9), IconStyle::weight(ICON_WEIGHT));
     let tx = field[0] + 34.0 * s;
-    let tw = core.renderer.ui.measure(&text, fs, 400, Font::Sans);
-    if text.is_empty() {
-        out.text(Text::new("Search, or name a new album", tx, ty, fs).color(theme::text_faint()));
-    } else {
-        out.text(Text::new(text.clone(), tx, ty, fs).color(theme::text()).clip(field));
+    let area = [tx, field[1], field[0] + field[2] - 10.0 * s - tx, field[3]];
+    let Core { actions, renderer, .. } = &mut *core;
+    if let Some(p) = &mut actions.picker {
+        p.field.draw(out, &mut renderer.ui, area, 14.0, s, "Search, or name a new album", true);
     }
-    out.quad(Quad::solid([tx + tw + 1.0 * s, field[1] + 8.0 * s, 1.5 * s, field[3] - 16.0 * s], rgb(theme::accent(), 1.0), 0.0));
 
     let list = [x + 8.0 * s, y + 110.0 * s, sw - 16.0 * s, sh - 118.0 * s];
     let rh = 50.0 * s;
@@ -1461,7 +1453,7 @@ pub fn drive(core: &mut Core, shot: &Shot, settle: &dyn Fn(&mut Core) -> Result<
         }
         open_picker(core, targets);
         if let Some(t) = &shot.typed {
-            core.actions.picker.as_mut().unwrap().text = t.clone();
+            core.actions.picker.as_mut().unwrap().field.set(t);
             retarget(core);
         }
     }

@@ -73,6 +73,10 @@ pub struct Collection {
     /// Query string for the `/timeline/bucket(s)` endpoints.
     pub query: String,
     pub filter: Filter,
+    /// Assets given up front (search results) instead of a server timeline; shown as they are.
+    pub fixed: Option<Arc<Vec<Asset>>>,
+    /// Keep `fixed`'s order (best match first) and start the grid at the top.
+    pub ordered: bool,
 }
 
 const LIBRARY_QUERY: &str = "visibility=timeline";
@@ -84,7 +88,11 @@ const KNOWN_QUERIES: [&str; 4] = [LIBRARY_QUERY, FAVORITES_QUERY, ARCHIVE_QUERY,
 
 impl Collection {
     fn new(key: impl Into<String>, title: impl Into<String>, query: impl Into<String>, filter: Filter) -> Self {
-        Self { key: key.into(), title: title.into(), query: query.into(), filter }
+        Self { key: key.into(), title: title.into(), query: query.into(), filter, fixed: None, ordered: false }
+    }
+    /// Search results: exactly these assets, in this order, grid starting at the top.
+    pub fn results(key: &str, title: &str, assets: Vec<Asset>) -> Self {
+        Self { fixed: Some(Arc::new(assets)), ordered: true, ..Self::new(key, title, "", Filter::All) }
     }
     pub fn library() -> Self {
         Self::new("library", "Library", LIBRARY_QUERY, Filter::All)
@@ -194,6 +202,10 @@ impl Loader {
     /// Re-syncs `collection` from the server even if it was fetched recently (the server told
     /// us something changed). Any collection may be affected, so every memo goes.
     pub fn refresh(&self, collection: Collection) {
+        // Search results aren't a server timeline; local edits already keep them current.
+        if collection.fixed.is_some() {
+            return;
+        }
         self.shared.fresh.lock().unwrap().clear();
         self.open(collection);
     }
@@ -348,7 +360,8 @@ impl Shared {
 
 async fn publish(shared: &Arc<Shared>, collection: &Arc<Collection>, request: u64, assets: Arc<Vec<Asset>>) {
     let c = collection.clone();
-    let library = Arc::new(tokio::task::spawn_blocking(move || Library::new(c.apply(&assets))).await.unwrap());
+    let build = move || if c.ordered { Library::ordered(c.apply(&assets), true) } else { Library::new(c.apply(&assets)) };
+    let library = Arc::new(tokio::task::spawn_blocking(build).await.unwrap());
     let generation = {
         let mut q = shared.queue.lock().unwrap();
         if q.request != request {
@@ -365,6 +378,16 @@ async fn publish(shared: &Arc<Shared>, collection: &Arc<Collection>, request: u6
 
 async fn sync(source: Source, shared: Arc<Shared>, collection: Arc<Collection>, request: u64) {
     let query = collection.query.clone();
+    if let Some(assets) = collection.fixed.clone() {
+        publish(&shared, &collection, request, assets).await;
+        let mut q = shared.queue.lock().unwrap();
+        if q.request == request {
+            q.syncing = false;
+            drop(q);
+            shared.send(Msg::Status(String::new()));
+        }
+        return;
+    }
     let fresh = shared.fresh.lock().unwrap().get(&query).filter(|(t, _)| t.elapsed() < FRESH_FOR).map(|f| f.1.clone());
     let mut ok = true;
     if let Some(assets) = fresh {

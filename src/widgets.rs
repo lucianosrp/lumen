@@ -553,3 +553,292 @@ impl Card {
         self.y
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Text field
+
+/// A single-line text input: caret, word-wise editing, select-all and paste. Containers draw
+/// the box (and any icon); `draw` puts the text, placeholder and caret inside an area of it.
+#[derive(Default, Clone)]
+pub struct TextField {
+    pub text: String,
+    /// Byte offset of the caret, always on a char boundary.
+    caret: usize,
+    /// Ctrl+A: everything is selected; typing replaces it, moving the caret drops it.
+    all: bool,
+    /// Horizontal scroll in physical px that keeps the caret in view.
+    scroll: f32,
+}
+
+/// What a key did to a `TextField`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edit {
+    /// The text changed.
+    Changed,
+    /// Only the caret or selection moved.
+    Moved,
+    /// Not an editing key (Enter, Escape, arrows up/down…): the container's business.
+    Ignored,
+}
+
+impl TextField {
+    pub fn set(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.caret = self.text.len();
+        self.all = false;
+    }
+
+    pub fn clear(&mut self) {
+        self.set("");
+    }
+
+    pub fn select_all(&mut self) {
+        self.all = !self.text.is_empty();
+        self.caret = self.text.len();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Types `t` at the caret (replacing a select-all). Control characters are dropped and
+    /// newlines become spaces. Returns whether anything changed.
+    pub fn insert(&mut self, t: &str) -> bool {
+        let t: String = t.chars().map(|c| if c == '\n' || c == '\t' { ' ' } else { c }).filter(|c| !c.is_control()).collect();
+        if t.is_empty() {
+            return false;
+        }
+        self.take_all();
+        self.text.insert_str(self.caret, &t);
+        self.caret += t.len();
+        true
+    }
+
+    /// Deletes the selection, if everything is selected. Returns whether it did.
+    fn take_all(&mut self) -> bool {
+        if !std::mem::take(&mut self.all) {
+            return false;
+        }
+        self.text.clear();
+        self.caret = 0;
+        true
+    }
+
+    fn prev_char(&self, at: usize) -> usize {
+        self.text[..at].char_indices().next_back().map_or(0, |(i, _)| i)
+    }
+
+    fn next_char(&self, at: usize) -> usize {
+        self.text[at..].chars().next().map_or(at, |c| at + c.len_utf8())
+    }
+
+    /// Start of the word before `at` (skipping spaces first), like Ctrl+Left.
+    fn prev_word(&self, at: usize) -> usize {
+        let chars: Vec<(usize, char)> = self.text[..at].char_indices().collect();
+        let mut k = chars.len();
+        while k > 0 && chars[k - 1].1.is_whitespace() {
+            k -= 1;
+        }
+        while k > 0 && !chars[k - 1].1.is_whitespace() {
+            k -= 1;
+        }
+        chars.get(k).map_or(at, |c| c.0)
+    }
+
+    /// End of the word after `at`, like Ctrl+Right.
+    fn next_word(&self, at: usize) -> usize {
+        let rest = &self.text[at..];
+        let mut it = rest.char_indices().peekable();
+        while it.peek().is_some_and(|(_, c)| c.is_whitespace()) {
+            it.next();
+        }
+        while it.peek().is_some_and(|(_, c)| !c.is_whitespace()) {
+            it.next();
+        }
+        it.peek().map_or(self.text.len(), |(i, _)| at + i)
+    }
+
+    /// Handles an editing key: typing, Backspace/Delete (Ctrl: a word), Ctrl+W/U, Left/Right
+    /// (Ctrl: by word), Home/End, Ctrl+A select all, Ctrl+V or Shift+Insert paste.
+    pub fn key(&mut self, event: &winit::event::KeyEvent, mods: winit::keyboard::ModifiersState) -> Edit {
+        use winit::keyboard::{Key, NamedKey};
+        if event.state != winit::event::ElementState::Pressed {
+            return Edit::Ignored;
+        }
+        let ctrl = mods.control_key();
+        let ch = match &event.logical_key {
+            Key::Character(c) => c.to_lowercase(),
+            _ => String::new(),
+        };
+        let old = self.text.clone();
+        match &event.logical_key {
+            Key::Named(NamedKey::Backspace) => {
+                if !self.take_all() && self.caret > 0 {
+                    let from = if ctrl { self.prev_word(self.caret) } else { self.prev_char(self.caret) };
+                    self.text.replace_range(from..self.caret, "");
+                    self.caret = from;
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                if !self.take_all() && self.caret < self.text.len() {
+                    let to = if ctrl { self.next_word(self.caret) } else { self.next_char(self.caret) };
+                    self.text.replace_range(self.caret..to, "");
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.caret = if std::mem::take(&mut self.all) { 0 } else if ctrl { self.prev_word(self.caret) } else { self.prev_char(self.caret) };
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                self.caret = if std::mem::take(&mut self.all) { self.text.len() } else if ctrl { self.next_word(self.caret) } else { self.next_char(self.caret) };
+            }
+            Key::Named(NamedKey::Home) => (self.caret, self.all) = (0, false),
+            Key::Named(NamedKey::End) => (self.caret, self.all) = (self.text.len(), false),
+            Key::Named(NamedKey::Insert) if mods.shift_key() => {
+                self.insert(&paste());
+            }
+            Key::Named(NamedKey::Space) if !ctrl => {
+                self.insert(" ");
+            }
+            _ if ctrl && ch == "a" => self.select_all(),
+            _ if ctrl && ch == "v" => {
+                self.insert(&paste());
+            }
+            _ if ctrl && ch == "w" => {
+                let from = self.prev_word(self.caret);
+                self.text.replace_range(from..self.caret, "");
+                (self.caret, self.all) = (from, false);
+            }
+            _ if ctrl && ch == "u" => {
+                self.text.replace_range(..self.caret, "");
+                (self.caret, self.all) = (0, false);
+            }
+            _ if !ctrl && !mods.super_key() && !mods.alt_key() => match &event.text {
+                Some(t) if t.chars().any(|c| !c.is_control()) => {
+                    self.insert(t);
+                }
+                _ => return Edit::Ignored,
+            },
+            _ => return Edit::Ignored,
+        }
+        // Backspace at the start and the like still count as handled.
+        if self.text != old { Edit::Changed } else { Edit::Moved }
+    }
+
+    /// Draws the text (or `placeholder` when empty) in `area`, physical px, `size` logical px,
+    /// with the caret when `focused`. Long text scrolls sideways to keep the caret in view.
+    pub fn draw(&mut self, out: &mut Layer, uir: &mut UiRenderer, area: [f32; 4], size: f32, s: f32, placeholder: &str, focused: bool) {
+        let fs = size * s;
+        let ty = (area[1] + area[3] / 2.0 - fs * 0.625).round();
+        let width = |uir: &mut UiRenderer, t: &str| {
+            // Trailing spaces count: measure against a stop character.
+            if t.is_empty() { 0.0 } else { uir.measure(&format!("{t}|"), fs, 400, Font::Sans) - uir.measure("|", fs, 400, Font::Sans) }
+        };
+        if self.text.is_empty() {
+            self.scroll = 0.0;
+            // Just right of the caret, so the two don't overlap.
+            let x = area[0] + if focused { 3.0 * s } else { 0.0 };
+            out.text(Text::new(placeholder, x, ty, fs).color(theme::text_faint()).clip(area));
+        } else {
+            let caret_x = width(uir, &self.text[..self.caret]);
+            let total = width(uir, &self.text);
+            let room = (area[2] - 2.0 * s).max(1.0);
+            self.scroll = self.scroll.min(caret_x).max(caret_x - room).clamp(0.0, (total - room).max(0.0));
+            let x = area[0] - self.scroll;
+            if self.all && focused {
+                let sel = [x - 1.0 * s, area[1] + area[3] / 2.0 - fs * 0.7, total + 2.0 * s, fs * 1.4];
+                let p = theme::palette();
+                out.quad(Quad::solid(sel, rgb(p.accent, if p.dark { 0.45 } else { 0.3 }), 3.0 * s));
+                out.clip_last(area);
+            }
+            out.text(Text::new(self.text.clone(), x, ty, fs).color(theme::text()).clip(area));
+        }
+        if focused && !self.all {
+            let cx = (area[0] + width(uir, &self.text[..self.caret]) - self.scroll).round();
+            let h = (fs * 1.25).round();
+            out.quad(Quad::solid([cx, (area[1] + (area[3] - h) / 2.0).round(), (1.5 * s).max(1.0), h], rgb(theme::accent(), 1.0), 0.0));
+        }
+    }
+}
+
+/// The Wayland clipboard as text, via `wl-paste` (empty if it's missing or slow).
+fn paste() -> String {
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new("wl-paste").args(["--no-newline", "--type", "text"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+        return String::new();
+    };
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() < std::time::Duration::from_millis(400) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                return String::new();
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        use std::io::Read;
+        let _ = so.read_to_string(&mut out);
+    }
+    out.chars().take(500).collect()
+}
+
+/// An activity spinner: a ring of dots with a fading tail, going round about once a second.
+/// `r` is the radius in physical px, `t` seconds since any fixed moment.
+pub fn spinner(out: &mut Layer, center: [f32; 2], r: f32, t: f32, color: u32) {
+    const N: usize = 12;
+    let head = (t * 1.2).fract() * N as f32;
+    let d = (r * 0.36).max(1.5);
+    for i in 0..N {
+        let a = i as f32 / N as f32 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let age = (head - i as f32).rem_euclid(N as f32) / N as f32;
+        let (x, y) = (center[0] + a.cos() * (r - d / 2.0), center[1] + a.sin() * (r - d / 2.0));
+        out.quad(Quad::solid([x - d / 2.0, y - d / 2.0, d, d], rgb(color, 1.0 - age * 0.85), d / 2.0));
+    }
+}
+
+/// A popover's body: `raised` with a hairline edge a shade lighter (dark) or darker (light).
+pub fn popover_bg(out: &mut Layer, r: [f32; 4], radius: f32, s: f32) {
+    let p = theme::palette();
+    let line = s.round().max(1.0);
+    let edge = if p.dark { p.shade(p.raised, 0.14) } else { theme::mix(p.raised, 0x000000, 0.14) };
+    // A soft drop shadow, then the edge and the body.
+    out.quad(Quad::solid([r[0] - 2.0 * line, r[1] + 2.0 * line, r[2] + 4.0 * line, r[3] + 4.0 * line], [0.0, 0.0, 0.0, if p.dark { 0.35 } else { 0.10 }], radius + 3.0 * line));
+    out.quad(Quad::solid([r[0] - line, r[1] - line, r[2] + 2.0 * line, r[3] + 2.0 * line], rgb(edge, 0.9), radius + line));
+    out.quad(Quad::solid(r, rgb(p.raised, 0.99), radius));
+}
+
+/// Shortens `text` with a trailing ellipsis to fit `max` physical px at `size` physical px.
+pub fn ellipsize(uir: &mut UiRenderer, text: &str, size: f32, weight: u16, max: f32) -> String {
+    if uir.measure(text, size, weight, Font::Sans) <= max {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let cut = |n: usize| chars[..n].iter().collect::<String>().trim_end().to_string() + "…";
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if uir.measure(&cut(mid), size, weight, Font::Sans) <= max { lo = mid } else { hi = mid - 1 }
+    }
+    cut(lo)
+}
+
+/// Breaks `text` into lines no wider than `max` physical px (at `size` physical px), at spaces.
+pub fn wrap(uir: &mut UiRenderer, text: &str, size: f32, weight: u16, max: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+        if line.is_empty() || uir.measure(&candidate, size, weight, Font::Sans) <= max {
+            line = candidate;
+        } else {
+            lines.push(std::mem::replace(&mut line, word.to_string()));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}

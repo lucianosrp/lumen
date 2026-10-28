@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 pub struct Grid {
     pub cols: u32,
     pub scroll: f32,
+    /// Content shorter than the screen sits at the top (search results) instead of centred.
+    pub top: bool,
 }
 
 #[derive(Clone)]
@@ -61,7 +63,9 @@ impl Grid {
     pub fn clamp(&mut self, n: usize, vp: &Viewport) {
         let h = self.content_height(n, vp);
         let room = vp.height - vp.top;
-        self.scroll = if h <= room {
+        self.scroll = if h <= room && self.top {
+            -vp.top
+        } else if h <= room {
             -vp.top - (room - h) / 2.0
         } else {
             self.scroll.clamp(-vp.top, h - vp.height)
@@ -147,7 +151,7 @@ fn ease(t: f32) -> f32 {
 
 impl Layout {
     pub fn new(vp: Viewport) -> Self {
-        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0 }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None, default_cols: 9, reflow_time: PINCH_REFLOW_TIME }
+        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0, top: false }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None, default_cols: 9, reflow_time: PINCH_REFLOW_TIME }
     }
 
     /// Columns at which the whole library fits on one screen.
@@ -184,20 +188,32 @@ impl Layout {
         self.level + 1 == self.levels.len()
     }
 
-    /// New library: start at the bottom (most recent), like Apple Photos.
+    /// New library: start at the bottom (most recent), like Apple Photos, or at the top when
+    /// `from_top` (search results, best match first). Keeping the place holds the bottom edge
+    /// still, or the top one when `from_top`.
     pub fn reset(&mut self, n: usize, keep_from_bottom: bool) {
         let from_bottom = self.target.content_height(self.n, &self.vp) - self.target.scroll;
+        // Results arriving in an empty (still searching) view start fresh too.
+        let fresh = self.target.top && self.n == 0;
         self.n = n;
         self.rebuild_levels();
-        if self.n == 0 || !keep_from_bottom {
+        if self.n == 0 || !keep_from_bottom || fresh {
             self.level = self.nearest_level(self.default_cols);
             self.target.cols = self.levels[self.level];
-            self.target.scroll = f32::MAX;
+            self.target.scroll = if self.target.top { f32::MIN } else { f32::MAX };
+        } else if self.target.top {
+            self.level = self.nearest_level(self.target.cols);
+            self.target.cols = self.levels[self.level];
         } else {
             self.target.scroll = self.target.content_height(n, &self.vp) - from_bottom;
         }
         self.target.clamp(n, &self.vp);
         self.from = None;
+    }
+
+    /// Whether new collections start at the top; see `reset`.
+    pub fn set_from_top(&mut self, top: bool) {
+        self.target.top = top;
     }
 
     pub fn resize(&mut self, vp: Viewport) {

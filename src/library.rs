@@ -4,7 +4,7 @@ use image::{DynamicImage, RgbaImage, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 
 /// One photo or video, as much as the grid needs to know about it.
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Asset {
     pub id: String,
     /// ISO-8601 capture time, e.g. "2024-03-15T10:22:01.000Z".
@@ -44,19 +44,26 @@ pub struct ThumbhashAtlas {
 
 pub const ATLAS_WIDTH: u32 = 8192;
 
-/// Oldest first, like Apple Photos (newest sits at the bottom of the grid).
+/// Oldest first, like Apple Photos (newest sits at the bottom of the grid), unless `ordered`.
 pub struct Library {
     pub assets: Vec<Asset>,
     pub thumbhashes: ThumbhashAtlas,
     pub videos: usize,
+    /// Kept in the order given (search results, best match first) rather than by date.
+    pub ordered: bool,
 }
 
 impl Library {
     pub fn new(mut assets: Vec<Asset>) -> Self {
         assets.sort_by(|a, b| a.taken.cmp(&b.taken));
+        Self::ordered(assets, false)
+    }
+
+    /// A library in exactly the given order when `keep` (else as `new` sorted it).
+    pub fn ordered(assets: Vec<Asset>, keep: bool) -> Self {
         let thumbhashes = build_thumbhash_atlas(&assets);
         let videos = assets.iter().filter(|a| a.video).count();
-        Self { assets, thumbhashes, videos }
+        Self { assets, thumbhashes, videos, ordered: keep }
     }
 
     pub fn len(&self) -> usize {
@@ -81,12 +88,15 @@ impl Library {
                 From::New(a) => &a.taken,
             }
         }
-        // Stable, so equal timestamps keep their relative order.
-        order.sort_by(|a, b| taken(self, a).cmp(taken(self, b)));
+        // Stable, so equal timestamps keep their relative order. Ordered libraries (search
+        // results) keep theirs, with additions at the end.
+        if !self.ordered {
+            order.sort_by(|a, b| taken(self, a).cmp(taken(self, b)));
+        }
         let th = &self.thumbhashes;
         if cell_size(order.len()) != th.cell {
             let assets = order.iter().map(|f| match f { From::Old(i) => self.assets[*i].clone(), From::New(a) => (*a).clone() }).collect();
-            let lib = Library::new(assets);
+            let lib = Library::ordered(assets, self.ordered);
             let at: std::collections::HashMap<&str, usize> = lib.assets.iter().enumerate().map(|(i, a)| (a.id.as_str(), i)).collect();
             let map = self.assets.iter().map(|a| at.get(a.id.as_str()).copied()).collect();
             return (lib, map);
@@ -134,7 +144,7 @@ impl Library {
         }
         let videos = assets.iter().filter(|a| a.video).count();
         let thumbhashes = ThumbhashAtlas { cell, cols, width: th.width, height: rows * cell, levels };
-        (Library { assets, thumbhashes, videos }, map)
+        (Library { assets, thumbhashes, videos, ordered: self.ordered }, map)
     }
 }
 
@@ -298,7 +308,7 @@ fn hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
     [f(5.0), f(3.0), f(1.0)]
 }
 
-fn iso_date(unix: i64) -> String {
+pub fn iso_date(unix: i64) -> String {
     // Civil-from-days (Howard Hinnant), good enough for labels.
     let days = unix.div_euclid(86_400);
     let z = days + 719_468;

@@ -29,6 +29,10 @@ const SLIDE_TIME: f32 = 0.22;
 const WHEEL_STEP: f32 = 60.0;
 /// Height of the pinned Settings row at the bottom (feat/settings).
 const FOOTER: f32 = 48.0;
+/// Height of the pinned strip at the top holding the search field (feat/search).
+pub const SEARCH: f32 = 46.0;
+/// The search pill's height inside it.
+const SEARCH_PILL: f32 = 30.0;
 
 /// What a click asks the app to do.
 pub enum Action {
@@ -159,6 +163,23 @@ impl Sidebar {
         self.albums.iter().map(|a| (a.id.clone(), a.album_name.clone(), a.asset_count)).collect()
     }
 
+    /// Named people as fetched for the sidebar: (id, name).
+    pub fn people(&self) -> Vec<(String, String)> {
+        self.people.iter().map(|p| (p.id.clone(), p.name.clone())).collect()
+    }
+
+    /// The search field's pill, physical px (it slides with the sidebar).
+    pub fn search_rect(&self, scale: f32) -> [f32; 4] {
+        let x0 = self.visible_width(scale) - WIDTH * scale;
+        let top = ((SEARCH - SEARCH_PILL) / 2.0 + 3.0) * scale;
+        [(x0 + 10.0 * scale).round(), top.round(), ((WIDTH - 20.0) * scale).round(), (SEARCH_PILL * scale).round()]
+    }
+
+    /// Slides the sidebar in if it's hidden (e.g. to focus the search field).
+    pub fn reveal(&mut self) {
+        self.shown = true;
+    }
+
     /// A row's thumbnail, e.g. "album:<id>", once loaded.
     pub fn image(&self, key: &str) -> Option<ImageId> {
         self.images.get(key).copied()
@@ -225,6 +246,10 @@ impl Sidebar {
             }
             return None;
         }
+        // The pinned search strip is the search field's (search.rs handles its clicks).
+        if y < SEARCH * scale {
+            return None;
+        }
         let cy = y / scale + self.scroll;
         let i = self.items.iter().position(|(top, it)| matches!(it, Item::Row(_)) && cy >= *top && cy < top + ROW)?;
         self.activate(i, height / scale)
@@ -235,6 +260,11 @@ impl Sidebar {
     /// Highlights a row by key; keys that match no row clear the highlight.
     pub fn set_selected(&mut self, key: &str) {
         self.selected = key.to_string();
+    }
+
+    /// The highlighted row's key.
+    pub fn selected(&self) -> &str {
+        &self.selected
     }
 
     pub fn select(&mut self, spec: &str, height: f32, scale: f32) -> Result<Option<Action>> {
@@ -274,7 +304,7 @@ impl Sidebar {
             }
             Target::People => {
                 let top = self.items.iter().find(|(_, it)| matches!(it, Item::Header("People"))).map(|(y, _)| *y)?;
-                self.scroll_to = (top - 8.0).min((self.content - view).max(0.0));
+                self.scroll_to = (top - SEARCH).min((self.content - view).max(0.0));
                 None
             }
         }
@@ -323,7 +353,7 @@ impl Sidebar {
                 target: Target::Open(c),
             }));
         }
-        let mut y = 12.0;
+        let mut y = SEARCH;
         self.items = items
             .into_iter()
             .map(|it| {
@@ -385,7 +415,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
     base.quad(Quad::solid([x0, 0.0, width, h], rgb(theme::sidebar(), 0.99), 0.0));
     let line = s.round().max(1.0);
     base.quad(Quad::solid([x0 + width - line, 0.0, line, h], rgb(theme::separator(), 1.0), 0.0));
-    let clip = [x0, 0.0, width - line, h - FOOTER * s];
+    let clip = [x0, SEARCH * s, width - line, h - (FOOTER + SEARCH) * s];
     let hover = sb.contains(sb.cursor, s).then_some(sb.cursor);
 
     for (top, item) in &sb.items {
@@ -441,6 +471,11 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         base.text(Text::new(label, x0 + 52.0 * s, mid - text_size * 0.625, text_size).weight(500).color(color).clip(clip));
     }
     draw_footer(sb, base, s, x0, h);
+    // The search strip, pinned over rows scrolled under it; search.rs draws the field on it.
+    base.quad(Quad::solid([x0, 0.0, width - line, SEARCH * s], rgb(theme::sidebar(), 1.0), 0.0));
+    if sb.scroll > 0.5 {
+        base.quad(Quad::solid([x0, SEARCH * s - line, width - line, line], rgb(theme::separator(), 1.0), 0.0));
+    }
 }
 
 /// The selected (accent) or hovered row background.

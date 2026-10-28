@@ -9,6 +9,7 @@ mod live;
 mod loader;
 mod map;
 mod render;
+mod search;
 mod settings;
 mod settings_ui;
 mod sidebar;
@@ -86,10 +87,14 @@ struct Core {
     hover_play: bool,
     /// Selection, photo actions and their popovers.
     actions: actions::Actions,
+    // feat/search: the sidebar's search field, suggestions and results; and the extra header
+    // height (logical px) its filter chips take.
+    search: search::Search,
+    header_extra: f32,
 }
 
-fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
-    Viewport { width: (size.0 as f32 - left).max(1.0), height: size.1 as f32, top: 76.0 * scale }
+fn viewport(size: (u32, u32), scale: f32, left: f32, extra: f32) -> Viewport {
+    Viewport { width: (size.0 as f32 - left).max(1.0), height: size.1 as f32, top: (76.0 + extra) * scale }
 }
 
 impl Core {
@@ -109,7 +114,7 @@ impl Core {
             renderer,
             library: None,
             generation: 0,
-            layout: Layout::new(viewport(size, scale, 0.0)),
+            layout: Layout::new(viewport(size, scale, 0.0, 0.0)),
             status: String::new(),
             frame: 1,
             pending: VecDeque::new(),
@@ -131,6 +136,8 @@ impl Core {
             hover: hover::Hover::new(),
             hover_play: true,
             actions,
+            search: search::Search::new(),
+            header_extra: 0.0,
         };
         settings::apply(&mut core);
         core
@@ -152,14 +159,22 @@ impl Core {
     fn resize(&mut self, size: (u32, u32), scale: f32) {
         self.size = size;
         self.scale = scale;
-        self.layout.resize(viewport(size, scale, self.left));
+        self.layout.resize(viewport(size, scale, self.left, self.header_extra));
     }
 
     /// Reserves `left` physical pixels on the left (e.g. for the sidebar).
     fn set_left(&mut self, left: f32) {
         if (left - self.left).abs() > 0.5 {
             self.left = left;
-            self.layout.resize(viewport(self.size, self.scale, left));
+            self.layout.resize(viewport(self.size, self.scale, left, self.header_extra));
+        }
+    }
+
+    /// Makes room under the header (search filter chips), in logical px.
+    fn set_header_extra(&mut self, extra: f32) {
+        if extra != self.header_extra {
+            self.header_extra = extra;
+            self.layout.resize(viewport(self.size, self.scale, self.left, extra));
         }
     }
 
@@ -173,6 +188,8 @@ impl Core {
                 Msg::Library { library, generation, collection } => {
                     // A different collection starts at its newest photos; a refresh keeps its place.
                     let refresh = self.library.is_some() && collection.key == self.collection.key;
+                    // Search results keep their order and start at the top.
+                    self.layout.set_from_top(collection.ordered);
                     self.collection = collection;
                     if refresh {
                         // Keeps thumbnails, selection and scroll: a refresh that matches the screen is invisible.
@@ -201,6 +218,7 @@ impl Core {
         let frame = self.frame;
         self.ui.clear();
         let sidebar_moving = sidebar::update(self, now);
+        let sidebar_moving = search::update(self, now) || sidebar_moving;
         // Settings › Playback: hover previews and their sound.
         self.hover_play = self.settings.hover_play;
         self.hover.sound = self.settings.hover_sound;
@@ -388,8 +406,10 @@ impl Core {
     /// Title, counts and sync status over the grid's top scrim.
     fn build_header(&mut self) {
         let library = self.collection.key == "library";
+        let search = search::header(self);
         let (title, subtitle) = match &self.library {
             _ if self.map.is_some() => self.map.as_ref().unwrap().header(),
+            _ if search.is_some() => search.unwrap(),
             None => ("Lumen".to_string(), String::new()),
             Some(lib) if lib.len() == 0 && library => ("Library".to_string(), "No photos yet".to_string()),
             Some(lib) if lib.len() == 0 => (self.collection.title.clone(), "No photos".to_string()),
@@ -574,8 +594,9 @@ impl ApplicationHandler for App {
         let (Some(core), Some(gpu), Some(window)) = (&mut self.core, &mut self.gpu, &self.window) else { return };
         let now = Instant::now();
         let scale = window.scale_factor() as f32;
-        // Popovers, selection clicks and action shortcuts come before everything else.
-        if actions::input(core, &event, self.modifiers) {
+        // The search field takes the keyboard while focused, then popovers, selection clicks and
+        // action shortcuts come before everything else.
+        if search::input(core, &event, self.modifiers) || actions::input(core, &event, self.modifiers) {
             window.request_redraw();
             return;
         }
@@ -713,6 +734,7 @@ impl ApplicationHandler for App {
                         window.set_fullscreen((!fs).then_some(Fullscreen::Borderless(None)));
                     }
                     Key::Character("q") if self.modifiers.control_key() => event_loop.exit(),
+                    Key::Named(NamedKey::Escape) => _ = search::escape(core),
                     Key::Character("b") if self.modifiers.control_key() => core.sidebar.toggle(),
                     Key::Character(",") if self.modifiers.control_key() => settings_ui::toggle(core),
                     Key::Character("m") => {
@@ -808,6 +830,7 @@ struct Shot {
     /// `--theme-wait <secs>`: before rendering, wait (up to that long) for the theme file to
     /// change, to check that a live palette switch recolours everything.
     theme_wait: Option<u64>,
+    search: Option<search::Shot>,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -840,6 +863,7 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
                 && core.status.is_empty()
                 && !core.viewer.loading()
                 && core.actions.is_idle()
+                && core.search.is_idle()
                 && core.map.as_ref().is_none_or(|m| m.is_idle())
                 && core.settings_page.as_ref().is_none_or(|p| p.is_idle());
             quiet = if done { quiet + 1 } else { 0 };
@@ -852,6 +876,9 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
             core.apply(action);
         }
         settle(&mut core)?;
+    }
+    if let Some(s) = &shot.search {
+        search::drive(&mut core, s, &settle)?;
     }
     let (cx, cy) = (core.layout.vp.width / 2.0, size.1 as f32 / 2.0);
     if let Some(shot) = &shot.map {
@@ -1148,6 +1175,7 @@ fn main() -> Result<()> {
             hover: flag("--hover"),
             hover_wait: flag("--hover-wait").and_then(|s| s.parse().ok()).unwrap_or(0),
             theme_wait: flag("--theme-wait").and_then(|s| s.parse().ok()),
+            search: search::Shot::parse(&args),
         };
         return screenshot(source, &path, size, scale, shot);
     }

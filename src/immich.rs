@@ -102,8 +102,21 @@ impl Immich {
 
     /// Sends a JSON body to `/api{path}` with auth; errors on non-2xx with the server's message.
     async fn send_json(&self, method: reqwest::Method, path: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
+        self.send_json_within(method, path, body, None).await
+    }
+
+    async fn send_json_within(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response> {
         let url = format!("{}/api{}", self.base, path);
         let mut req = self.http.request(method.clone(), &url).header("x-api-key", &self.key);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
         if !body.is_null() {
             req = req.json(body);
         }
@@ -137,6 +150,12 @@ impl Immich {
         Self::reply(self.send_json(reqwest::Method::POST, path, &body).await?).await
     }
 
+    /// POST with a longer deadline than the client's default, e.g. a smart search that has to
+    /// wait for the server to load its CLIP model first.
+    pub async fn post_json_within(&self, path: &str, body: serde_json::Value, timeout: std::time::Duration) -> Result<serde_json::Value> {
+        Self::reply(self.send_json_within(reqwest::Method::POST, path, &body, Some(timeout)).await?).await
+    }
+
     pub async fn delete_json(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         Self::reply(self.send_json(reqwest::Method::DELETE, path, &body).await?).await
     }
@@ -161,7 +180,7 @@ impl Immich {
 }
 
 /// 11001 (ms) or "0:00:11.001" → 11001; None for zero or unparsable.
-fn duration_ms(d: &serde_json::Value) -> Option<u32> {
+pub fn duration_ms(d: &serde_json::Value) -> Option<u32> {
     let secs = match d {
         serde_json::Value::Number(ms) => ms.as_f64()? / 1000.0,
         serde_json::Value::String(s) => {
