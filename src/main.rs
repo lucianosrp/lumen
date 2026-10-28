@@ -3,6 +3,7 @@ mod immich;
 mod library;
 mod loader;
 mod render;
+mod sidebar;
 mod ui;
 mod ui_render;
 
@@ -12,14 +13,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Theme, Window, WindowId};
 
 use grid::{Layout, Viewport};
 use library::Library;
-use loader::{Loader, Msg, Source, Thumb, Tier, group};
+use loader::{Collection, Loader, Msg, Source, Thumb, Tier, group};
 use render::{Instance, LARGE_BIT, NO_SLOT, Renderer};
 use ui::{Text, theme};
 
@@ -57,6 +58,9 @@ struct Core {
     left: f32,
     /// UI drawn over the grid, rebuilt every frame.
     ui: ui::Frame,
+    sidebar: sidebar::Sidebar,
+    /// What the grid is showing (the library, an album…).
+    collection: Arc<Collection>,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -65,6 +69,7 @@ fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
 
 impl Core {
     fn new(loader: Loader, renderer: Renderer, size: (u32, u32), scale: f32) -> Self {
+        let sidebar = sidebar::Sidebar::new(&loader);
         Self {
             loader,
             renderer,
@@ -82,6 +87,8 @@ impl Core {
             velocity: 0.0,
             left: 0.0,
             ui: ui::Frame::default(),
+            sidebar,
+            collection: Arc::new(Collection::library()),
         }
     }
 
@@ -92,7 +99,6 @@ impl Core {
     }
 
     /// Reserves `left` physical pixels on the left (e.g. for the sidebar).
-    #[allow(dead_code)]
     fn set_left(&mut self, left: f32) {
         if (left - self.left).abs() > 0.5 {
             self.left = left;
@@ -103,8 +109,10 @@ impl Core {
     fn pump(&mut self) {
         while let Ok(msg) = self.loader.rx.try_recv() {
             match msg {
-                Msg::Library { library, generation } => {
-                    let refresh = self.library.is_some();
+                Msg::Library { library, generation, collection } => {
+                    // A different collection starts at its newest photos; a refresh keeps its place.
+                    let refresh = self.library.is_some() && collection.key == self.collection.key;
+                    self.collection = collection;
                     self.renderer.set_library(&library);
                     self.layout.reset(library.len(), refresh);
                     self.library = Some(library);
@@ -125,6 +133,7 @@ impl Core {
         self.frame += 1;
         let frame = self.frame;
         self.ui.clear();
+        let sidebar_moving = sidebar::update(self, now);
 
         // Mouse wheels glide to their target; touchpads coast after the fingers lift.
         if self.smooth_scroll.abs() > 0.5 {
@@ -144,7 +153,7 @@ impl Core {
         if self.library.is_none() {
             self.instances.clear();
             self.build_header();
-            return false;
+            return sidebar_moving;
         }
         let vp = self.layout.vp;
 
@@ -226,21 +235,42 @@ impl Core {
         }
 
         self.build_header();
-        fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
+        sidebar_moving || fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
+    }
+
+    /// Handles a sidebar click (or `--select`).
+    fn apply(&mut self, action: sidebar::Action) {
+        match action {
+            sidebar::Action::Open(c) => self.loader.open(c),
+            // Placeholder until the map view lands.
+            sidebar::Action::Places => log::info!("Places selected; no map view yet"),
+        }
     }
 
     /// Title, counts and sync status over the grid's top scrim.
     fn build_header(&mut self) {
+        let library = self.collection.key == "library";
         let (title, subtitle) = match &self.library {
             None => ("Lumen".to_string(), String::new()),
-            Some(lib) if lib.len() == 0 => ("Library".to_string(), "No photos yet".to_string()),
+            Some(lib) if lib.len() == 0 && library => ("Library".to_string(), "No photos yet".to_string()),
+            Some(lib) if lib.len() == 0 => (self.collection.title.clone(), "No photos".to_string()),
             Some(lib) => {
                 let photos = lib.len() - lib.videos;
-                let counts = format!("{} Photos · {} Videos", group(photos), group(lib.videos));
+                let plural = |n: usize, what: &str| format!("{} {what}{}", group(n), if n == 1 { "" } else { "s" });
+                let counts = match (photos, lib.videos) {
+                    (p, 0) if !library => plural(p, "Photo"),
+                    (0, v) if !library => plural(v, "Video"),
+                    (p, v) => format!("{} · {}", plural(p, "Photo"), plural(v, "Video")),
+                };
                 if self.layout.is_fit_all() {
                     let years = |a: &library::Asset| a.year_month().map_or(0, |(y, _)| y);
                     let (first, last) = (years(&lib.assets[0]), years(lib.assets.last().unwrap()));
-                    ("All Photos".to_string(), format!("{first} – {last}  ·  {counts}"))
+                    let span = if first == last { first.to_string() } else { format!("{first} – {last}") };
+                    if library {
+                        ("All Photos".to_string(), format!("{span}  ·  {counts}"))
+                    } else {
+                        (self.collection.title.clone(), format!("{counts}  ·  {span}"))
+                    }
                 } else {
                     let vp = self.layout.vp;
                     let i = self.layout.index_at(vp.width / 2.0, vp.top + 2.0).map_or(0, |(i, _, _)| i);
@@ -248,7 +278,7 @@ impl Core {
                         .year_month()
                         .map(|(y, m)| format!("{} {y}", MONTHS[(m as usize).clamp(1, 12) - 1]))
                         .unwrap_or_default();
-                    (label, counts)
+                    if library { (label, counts) } else { (self.collection.title.clone(), format!("{counts}  ·  {label}")) }
                 }
             }
         };
@@ -366,8 +396,23 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
+                core.sidebar.cursor = self.cursor;
                 window.request_redraw();
             }
+            // Sidebar: hover, clicks, its own scrolling.
+            WindowEvent::CursorLeft { .. } => {
+                core.sidebar.cursor = (-1.0, -1.0);
+                window.request_redraw();
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
+                if core.sidebar.contains(self.cursor, scale) =>
+            {
+                if let Some(action) = core.sidebar.click(scale, core.size.1 as f32) {
+                    core.apply(action);
+                }
+                window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } if core.sidebar.wheel(delta, scale) => window.request_redraw(),
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 let zooming = self.modifiers.control_key() || self.modifiers.super_key();
                 match (delta, zooming) {
@@ -429,6 +474,7 @@ impl ApplicationHandler for App {
                         window.set_fullscreen((!fs).then_some(Fullscreen::Borderless(None)));
                     }
                     Key::Character("q") if self.modifiers.control_key() => event_loop.exit(),
+                    Key::Character("b") if self.modifiers.control_key() => core.sidebar.toggle(),
                     _ => {}
                 }
                 window.request_redraw();
@@ -494,12 +540,21 @@ async fn gpu_device(
 // ---------------------------------------------------------------------------------------------
 // Headless: render one frame to a PNG once everything visible has loaded.
 
-fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, zoom: i32, fit: bool) -> Result<()> {
+struct Shot {
+    zoom: i32,
+    fit: bool,
+    /// Sidebar row to click first, see `Sidebar::select`.
+    select: Option<String>,
+    sidebar: bool,
+}
+
+fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let (_, device, queue) = pollster::block_on(gpu_device(&instance, None))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let renderer = Renderer::new(device, queue, format);
     let mut core = Core::new(Loader::start(source, || {}), renderer, size, scale);
+    core.sidebar.set_shown(shot.sidebar);
 
     let settle = |core: &mut Core| -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -511,17 +566,27 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, zoom: i3
             std::thread::sleep(Duration::from_millis(30));
             core.pump();
             let busy = core.update(Instant::now());
-            let done = core.library.is_some() && !busy && core.loader.is_idle() && core.status.is_empty();
+            let done = core.library.is_some()
+                && !busy
+                && core.loader.is_idle()
+                && core.sidebar.is_idle()
+                && core.status.is_empty();
             quiet = if done { quiet + 1 } else { 0 };
         }
         Ok(())
     };
     settle(&mut core)?;
-    let (cx, cy) = (size.0 as f32 / 2.0, size.1 as f32 / 2.0);
-    if fit {
+    if let Some(spec) = &shot.select {
+        if let Some(action) = core.sidebar.select(spec, size.1 as f32, scale)? {
+            core.apply(action);
+        }
+        settle(&mut core)?;
+    }
+    let (cx, cy) = (core.layout.vp.width / 2.0, size.1 as f32 / 2.0);
+    if shot.fit {
         core.layout.zoom_to(core.layout.levels() - 1, cx, cy, Instant::now());
-    } else if zoom != 0 {
-        core.layout.zoom(zoom, cx, cy, Instant::now());
+    } else if shot.zoom != 0 {
+        core.layout.zoom(shot.zoom, cx, cy, Instant::now());
     }
     settle(&mut core)?;
 
@@ -602,8 +667,13 @@ fn main() -> Result<()> {
             .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
             .unwrap_or((1600, 1000));
         let scale = flag("--scale").and_then(|s| s.parse().ok()).unwrap_or(1.0);
-        let zoom = flag("--zoom").and_then(|s| s.parse().ok()).unwrap_or(0);
-        return screenshot(source, &path, size, scale, zoom, args.iter().any(|a| a == "--fit"));
+        let shot = Shot {
+            zoom: flag("--zoom").and_then(|s| s.parse().ok()).unwrap_or(0),
+            fit: args.iter().any(|a| a == "--fit"),
+            select: flag("--select"),
+            sidebar: !args.iter().any(|a| a == "--no-sidebar"),
+        };
+        return screenshot(source, &path, size, scale, shot);
     }
 
     let event_loop = EventLoop::<()>::with_user_event().build().context("event loop")?;
