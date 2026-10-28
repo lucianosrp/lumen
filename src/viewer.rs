@@ -1330,7 +1330,7 @@ impl Viewer {
                 Text::new(glyph, c.0 + nudge * s, c.1 - 19.0 * s, 30.0 * s)
                     .icon()
                     .align(Align::Center)
-                    .color(fade_color(theme::TEXT, progress)),
+                    .color(fade_color(theme::text(), progress)),
             );
             let label = if failed {
                 Some("Can't play this video".to_string())
@@ -1344,7 +1344,7 @@ impl Viewer {
                     Text::new(label, c.0, c.1 + rad + 10.0 * s, 13.0 * s)
                         .weight(600)
                         .align(Align::Center)
-                        .color(fade_color(theme::TEXT, progress)),
+                        .color(fade_color(theme::text(), progress)),
                 );
             }
             if !failed {
@@ -1367,7 +1367,7 @@ impl Viewer {
         out.quad(Quad::solid(bar, rgb(0x1c1c1e, 0.82 * ca), bh / 2.0));
         let text = |c: [u8; 4]| fade_color(c, ca);
         let icon = |out: &mut Layer, cx: f32, glyph: &str, size: f32| {
-            out.text(Text::new(glyph, cx, cy - size * 0.625, size).icon().align(Align::Center).color(text(theme::TEXT)));
+            out.text(Text::new(glyph, cx, cy - size * 0.625, size).icon().align(Align::Center).color(text(theme::text())));
         };
 
         let toggle = [x + 8.0 * s, cy - 17.0 * s, 34.0 * s, 34.0 * s];
@@ -1392,13 +1392,13 @@ impl Viewer {
         let (ew, rw) = (slot(r, &elapsed), slot(r, &remaining));
         let ty = cy - size * 0.625;
         let ex = x + 50.0 * s;
-        out.text(Text::new(elapsed, ex, ty, size).weight(600).color(text(theme::TEXT_DIM)));
+        out.text(Text::new(elapsed, ex, ty, size).weight(600).color(text(theme::text_dim())));
 
         let vol_w = 64.0 * s;
         let vol = [x + bw - 18.0 * s - vol_w, bar[1], vol_w, bh];
         let mute_cx = vol[0] - 18.0 * s;
         let rx = mute_cx - 20.0 * s;
-        out.text(Text::new(remaining, rx, ty, size).weight(600).align(Align::Right).color(text(theme::TEXT_DIM)));
+        out.text(Text::new(remaining, rx, ty, size).weight(600).align(Align::Right).color(text(theme::text_dim())));
         let track = [ex + ew + 12.0 * s, bar[1], (rx - rw - 12.0 * s) - (ex + ew + 12.0 * s), bh];
 
         let slider = |out: &mut Layer, t: [f32; 4], f: f32, knob: f32| {
@@ -1441,11 +1441,11 @@ impl Viewer {
         let bg = if playing { rgb(0xffffff, 0.30 * ca) } else { rgb(0x1c1c1e, 0.62 * ca) };
         out.quad(Quad::solid(pill, bg, ph / 2.0));
         let cy = y + ph / 2.0;
-        out.text(Text::new(hover::LIVE_GLYPH, x + 9.0 * s, cy - icon * 0.625, icon).icon().color(fade_color(theme::TEXT, ca)));
+        out.text(Text::new(hover::LIVE_GLYPH, x + 9.0 * s, cy - icon * 0.625, icon).icon().color(fade_color(theme::text(), ca)));
         out.text(
             Text::new("LIVE", x + 9.0 * s + icon + 5.0 * s, cy - size * 0.625, size)
                 .weight(700)
-                .color(fade_color(theme::TEXT, ca)),
+                .color(fade_color(theme::text(), ca)),
         );
         o.hits.push((Hit::Live, pill));
     }
@@ -1463,13 +1463,13 @@ impl Viewer {
         let button = |out: &mut Layer, x: f32, icon: &str, on: bool| {
             let d = 34.0 * s;
             let rect = [x, 16.0 * s, d, d];
-            let bg = if on { rgb(theme::ACCENT, 0.9 * ca) } else { rgb(0xffffff, 0.14 * ca) };
+            let bg = if on { rgb(theme::accent(), 0.9 * ca) } else { rgb(0xffffff, 0.14 * ca) };
             out.quad(Quad::solid(rect, bg, d / 2.0));
             out.text(
                 Text::new(icon, x + d / 2.0, rect[1] + d / 2.0 - 10.0 * s, 16.0 * s)
                     .icon()
                     .align(Align::Center)
-                    .color(fade_color(theme::TEXT, ca)),
+                    .color(fade_color(theme::text(), ca)),
             );
             rect
         };
@@ -1489,8 +1489,8 @@ impl Viewer {
         };
         let x = 64.0 * s;
         let max = (w - x - 80.0 * s - self.toolbar_width).max(50.0);
-        out.text(Text::new(title, x, 15.0 * s, 16.0 * s).weight(600).max_width(max).color(fade_color(theme::TEXT, ca)));
-        out.text(Text::new(subtitle, x, 36.0 * s, 13.0 * s).weight(500).max_width(max).color(fade_color(theme::TEXT_DIM, ca)));
+        out.text(Text::new(title, x, 15.0 * s, 16.0 * s).weight(600).max_width(max).color(fade_color(theme::text(), ca)));
+        out.text(Text::new(subtitle, x, 36.0 * s, 13.0 * s).weight(500).max_width(max).color(fade_color(theme::text_dim(), ca)));
     }
 
     fn draw_panel(&self, o: &mut Open, details: Option<&Details>, ca: f32, s: f32, r: &mut Renderer, out: &mut Layer) {
@@ -1509,16 +1509,16 @@ impl Viewer {
         let Some(d) = details else {
             let failed = self.slots.get(&o.lib.assets[o.index].id).is_some_and(|s| s.state[INFO] == Load::Failed);
             let text = if failed { "No details available" } else { "Loading…" };
-            line(&mut texts, &mut y, text.into(), 14.0, 500, theme::TEXT_DIM);
+            line(&mut texts, &mut y, text.into(), 14.0, 500, theme::text_dim());
             return finish_panel(out, x, top, pw, y + pad, ca, s, texts, rules, &mut o.hits);
         };
         let exif = d.exif_info.clone().unwrap_or_default();
         if let Some(t) = d.local_date_time.as_deref().and_then(DateTime::parse) {
-            line(&mut texts, &mut y, t.date(), 15.0, 600, theme::TEXT);
-            line(&mut texts, &mut y, t.time(), 13.0, 500, theme::TEXT_DIM);
+            line(&mut texts, &mut y, t.date(), 15.0, 600, theme::text());
+            line(&mut texts, &mut y, t.time(), 13.0, 500, theme::text_dim());
         }
         if let Some(name) = &d.original_file_name {
-            line(&mut texts, &mut y, name.clone(), 13.0, 500, theme::TEXT_DIM);
+            line(&mut texts, &mut y, name.clone(), 13.0, 500, theme::text_dim());
         }
 
         let camera = match (exif.make.as_deref(), exif.model.as_deref()) {
@@ -1540,10 +1540,10 @@ impl Viewer {
             rules.push(y);
             y += 14.0 * s;
             if let Some(c) = camera {
-                line(&mut texts, &mut y, c, 15.0, 600, theme::TEXT);
+                line(&mut texts, &mut y, c, 15.0, 600, theme::text());
             }
             if let Some(lens) = exif.lens_model.clone() {
-                line(&mut texts, &mut y, lens, 13.0, 500, theme::TEXT_DIM);
+                line(&mut texts, &mut y, lens, 13.0, 500, theme::text_dim());
             }
             if !settings.is_empty() {
                 // Evenly spaced exposure "chips", like Photos' camera row.
@@ -1558,7 +1558,7 @@ impl Viewer {
                         Text::new(v, cx + cw / 2.0, y + (26.0 - size * 1.25) / 2.0 * s, size * s)
                             .weight(600)
                             .align(Align::Center)
-                            .color(fade_color(theme::TEXT, ca)),
+                            .color(fade_color(theme::text(), ca)),
                     );
                 }
                 y += 26.0 * s + 10.0 * s;
@@ -1570,7 +1570,7 @@ impl Viewer {
             let size = exif.file_size_in_byte.map(format_bytes);
             let row: Vec<String> = [dims, size].into_iter().flatten().collect();
             if !row.is_empty() {
-                line(&mut texts, &mut y, row.join(" · "), 13.0, 500, theme::TEXT_DIM);
+                line(&mut texts, &mut y, row.join(" · "), 13.0, 500, theme::text_dim());
             }
         }
 
@@ -1584,16 +1584,16 @@ impl Viewer {
             rules.push(y);
             y += 14.0 * s;
             if let Some((first, rest)) = region.split_first() {
-                line(&mut texts, &mut y, first.to_string(), 15.0, 600, theme::TEXT);
+                line(&mut texts, &mut y, first.to_string(), 15.0, 600, theme::text());
                 if !rest.is_empty() {
-                    line(&mut texts, &mut y, rest.join(", "), 13.0, 500, theme::TEXT_DIM);
+                    line(&mut texts, &mut y, rest.join(", "), 13.0, 500, theme::text_dim());
                 }
             }
             if let (Some(lat), Some(lon)) = (exif.latitude, exif.longitude) {
                 let ns = if lat >= 0.0 { "N" } else { "S" };
                 let ew = if lon >= 0.0 { "E" } else { "W" };
                 let text = format!("{:.4}° {ns}, {:.4}° {ew}", lat.abs(), lon.abs());
-                line(&mut texts, &mut y, text, 12.0, 500, theme::TEXT_FAINT);
+                line(&mut texts, &mut y, text, 12.0, 500, theme::text_faint());
             }
         }
         finish_panel(out, x, top, pw, y + pad - 4.0 * s, ca, s, texts, rules, &mut o.hits)
@@ -1616,7 +1616,7 @@ fn finish_panel(
     let rect = [x, top, w, bottom - top];
     out.quad(Quad::solid(rect, rgb(0x1c1c1e, 0.94 * ca), 14.0 * s));
     for y in rules {
-        out.quad(Quad::solid([x + 18.0 * s, y, w - 36.0 * s, 1.0], rgb(theme::SEPARATOR, ca), 0.0));
+        out.quad(Quad::solid([x + 18.0 * s, y, w - 36.0 * s, 1.0], rgb(theme::separator(), ca), 0.0));
     }
     for t in texts {
         out.text(t);

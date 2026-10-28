@@ -2,6 +2,7 @@ mod actions;
 mod gestures;
 mod grid;
 mod hover;
+mod icons;
 mod immich;
 mod library;
 mod live;
@@ -11,6 +12,7 @@ mod render;
 mod settings;
 mod settings_ui;
 mod sidebar;
+mod theme;
 mod storage;
 mod ui;
 mod ui_render;
@@ -34,7 +36,7 @@ use grid::{Layout, Viewport};
 use library::Library;
 use loader::{Collection, Loader, Msg, Source, Thumb, Tier, group};
 use render::{Instance, LARGE_BIT, NO_SLOT, Renderer, XL_BIT};
-use ui::{Text, theme};
+use ui::Text;
 
 // Tile-size thresholds for each thumbnail tier: see `settings::Quality::tiers`.
 const FADE: f32 = 0.22;
@@ -101,6 +103,7 @@ impl Core {
         // The renderer was built for a memory budget already; don't rebuild its atlases.
         let settings = settings::Settings { gpu_memory: renderer.gpu_memory, ..settings::Settings::load() };
         let actions = actions::Actions::new(&loader);
+        theme::watch(loader.waker());
         let mut core = Self {
             loader,
             renderer,
@@ -420,14 +423,14 @@ impl Core {
         };
         let (s, x) = (self.scale, self.left + 20.0 * self.scale);
         let base = &mut self.ui.base;
-        base.text(Text::new(title, x, 14.0 * s, 26.0 * s).weight(700).color(theme::TEXT));
-        base.text(Text::new(subtitle, x, 48.0 * s, 13.0 * s).weight(500).color(theme::TEXT_DIM));
+        base.text(Text::new(title, x, 14.0 * s, 26.0 * s).weight(700).color(theme::text()));
+        base.text(Text::new(subtitle, x, 48.0 * s, 13.0 * s).weight(500).color(theme::text_dim()));
         if !self.status.is_empty() {
             let right = self.size.0 as f32 - 20.0 * s;
             base.text(
                 Text::new(self.status.clone(), right, 22.0 * s, 14.0 * s)
                     .weight(500)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .align(ui::Align::Right),
             );
         }

@@ -30,15 +30,17 @@ pub struct Quad {
     pub image: Option<ImageId>,
     /// Image sub-rectangle in 0..1 texture coordinates: [u0, v0, u1, v1].
     pub uv: [f32; 4],
+    /// A vector icon to rasterise and draw (tinted by `color`), instead of `image`.
+    pub icon: Option<crate::icons::IconKey>,
 }
 
 impl Quad {
     pub fn solid(rect: [f32; 4], color: [f32; 4], radius: f32) -> Self {
-        Self { rect, color, radius, image: None, uv: [0.0, 0.0, 1.0, 1.0] }
+        Self { rect, color, radius, image: None, uv: [0.0, 0.0, 1.0, 1.0], icon: None }
     }
 
     pub fn image(rect: [f32; 4], image: ImageId, uv: [f32; 4], opacity: f32, radius: f32) -> Self {
-        Self { rect, color: [1.0, 1.0, 1.0, opacity], radius, image: Some(image), uv }
+        Self { rect, color: [1.0, 1.0, 1.0, opacity], radius, image: Some(image), uv, icon: None }
     }
 }
 
@@ -111,6 +113,20 @@ impl Layer {
     pub fn quad(&mut self, q: Quad) {
         self.quads.push(q);
     }
+
+    /// A vector icon centred on `center`, `size` physical px square, tinted `color`.
+    pub fn icon(&mut self, name: &'static str, center: [f32; 2], size: f32, color: [f32; 4]) {
+        self.icon_styled(name, center, size, color, crate::icons::IconStyle::default());
+    }
+
+    pub fn icon_styled(&mut self, name: &'static str, center: [f32; 2], size: f32, color: [f32; 4], style: crate::icons::IconStyle) {
+        debug_assert!(crate::icons::exists(name), "unknown icon {name}");
+        // Whole pixels: the raster is made at exactly this size, so it lands pixel-aligned.
+        let px = size.round().max(1.0);
+        let rect = [(center[0] - px / 2.0).round(), (center[1] - px / 2.0).round(), px, px];
+        let key = crate::icons::IconKey { name, px: px as u16, weight: (style.weight * 100.0) as u16, filled: style.filled };
+        self.quads.push(Quad { rect, color, radius: 0.0, image: None, uv: [0.0, 0.0, 1.0, 1.0], icon: Some(key) });
+    }
     pub fn text(&mut self, t: Text) {
         self.texts.push(t);
     }
@@ -144,13 +160,7 @@ pub fn contains(r: [f32; 4], x: f32, y: f32) -> bool {
     x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3]
 }
 
-/// Shared palette so features look like one app.
+/// Shared palette so features look like one app; live, see `crate::theme`.
 pub mod theme {
-    pub const BG: u32 = 0x010101;
-    pub const SIDEBAR: u32 = 0x161618;
-    pub const SEPARATOR: u32 = 0x2a2a2d;
-    pub const ACCENT: u32 = 0x0a84ff;
-    pub const TEXT: [u8; 4] = [255, 255, 255, 235];
-    pub const TEXT_DIM: [u8; 4] = [255, 255, 255, 150];
-    pub const TEXT_FAINT: [u8; 4] = [255, 255, 255, 95];
+    pub use crate::theme::*;
 }

@@ -195,7 +195,7 @@ impl Ctx<'_> {
         let stretch = self.anim(&format!("{id}#press"), if pressing { 1.0 } else { 0.0 }, 24.0);
         let hover = enabled && self.input.hovered(hit);
         let off = if hover { 0x434347 } else { TRACK };
-        let on_c = if hover { ACCENT_HOVER } else { theme::ACCENT };
+        let on_c = if hover { ACCENT_HOVER } else { theme::accent() };
         self.quad(r, dim(mix(off, on_c, t), enabled), h / 2.0);
         let pad = 2.0 * s;
         let k = h - pad * 2.0;
@@ -291,7 +291,7 @@ impl Ctx<'_> {
             }
         }
         let kx = x + w * shown;
-        self.quad([x, mid - th / 2.0, (kx - x).max(th), th], rgb(theme::ACCENT, 1.0), th / 2.0);
+        self.quad([x, mid - th / 2.0, (kx - x).max(th), th], rgb(theme::accent(), 1.0), th / 2.0);
         let hover = self.input.hovered(hit);
         let grow = self.anim(&format!("{id}#hover"), if held { 1.0 } else if hover { 0.5 } else { 0.0 }, 20.0);
         let k = knob * (1.0 + 0.1 * grow);
@@ -313,7 +313,7 @@ impl Ctx<'_> {
         let (hover, down) = (enabled && self.input.hovered(r), enabled && self.input.pressing(r));
         let (bg, fg) = match kind {
             ButtonKind::Primary => {
-                (if down { ACCENT_DOWN } else if hover { ACCENT_HOVER } else { theme::ACCENT }, [255, 255, 255, 255])
+                (if down { ACCENT_DOWN } else if hover { ACCENT_HOVER } else { theme::accent() }, [255, 255, 255, 255])
             }
             ButtonKind::Secondary | ButtonKind::Destructive => {
                 let bg = if down { BUTTON_DOWN } else if hover { BUTTON_HOVER } else { BUTTON };
@@ -359,7 +359,7 @@ impl Ctx<'_> {
         let title = &self.ellipsize(title, 13.5, 500, max);
         let sub = sub.map(|t| self.ellipsize(t, 11.5, 400, max));
         let sub = sub.as_deref();
-        let color = dim_text(theme::TEXT, enabled);
+        let color = dim_text(theme::text(), enabled);
         match sub {
             Some(sub) => {
                 self.text(title, x, mid - 8.5 * self.s, 13.5, 500, color, Align::Left);

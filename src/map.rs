@@ -1178,7 +1178,7 @@ impl MapView {
             push(layer, Quad::solid(r, [1.0, 1.0, 1.0, a], radius), area);
             let b = 2.0 * s * r[2] / (PIN * s);
             let inner = [r[0] + b, r[1] + b, r[2] - 2.0 * b, r[3] - 2.0 * b];
-            push(layer, Quad::solid(inner, ui::rgb(theme::SEPARATOR, a), radius - b), area);
+            push(layer, Quad::solid(inner, ui::rgb(theme::separator(), a), radius - b), area);
             match self.thumbs.get_mut(id) {
                 Some(t) => {
                     t.used = frame;
@@ -1203,7 +1203,7 @@ impl MapView {
                 let ring = 1.5 * s;
                 let outer = [cx - w / 2.0 - ring, cy - h / 2.0 - ring, w + 2.0 * ring, h + 2.0 * ring];
                 push(layer, Quad::solid(outer, [1.0, 1.0, 1.0, a], outer[3] / 2.0), area);
-                push(layer, Quad::solid([cx - w / 2.0, cy - h / 2.0, w, h], ui::rgb(theme::ACCENT, a), h / 2.0), area);
+                push(layer, Quad::solid([cx - w / 2.0, cy - h / 2.0, w, h], ui::rgb(theme::accent(), a), h / 2.0), area);
                 let text = Text::new(label, cx, cy - size * 0.625, size)
                     .weight(700)
                     .color([255, 255, 255, (255.0 * a) as u8])
@@ -1237,7 +1237,7 @@ impl MapView {
             let (cx, y) = (r[0] + r[2] / 2.0, r[1] + r[3] + 8.0 * s);
             let a = pin.hover;
             push(&mut self.top, Quad::solid([cx - w / 2.0, y + 2.0 * s, w, h], [0.0, 0.0, 0.0, 0.3 * a], h / 2.0), area);
-            push(&mut self.top, Quad::solid([cx - w / 2.0, y, w, h], ui::rgb(theme::SIDEBAR, 0.94 * a), h / 2.0), area);
+            push(&mut self.top, Quad::solid([cx - w / 2.0, y, w, h], ui::rgb(theme::sidebar(), 0.94 * a), h / 2.0), area);
             let text = Text::new(pin.title.clone(), cx, y + (h - size * 1.25) / 2.0, size)
                 .weight(600)
                 .color([255, 255, 255, (235.0 * a) as u8])
@@ -1250,7 +1250,7 @@ impl MapView {
             let c = self.focus();
             let text = Text::new("No photos with a location yet", c[0], c[1] - 10.0 * s, 17.0 * s)
                 .weight(600)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .align(ui::Align::Center);
             self.layer.text(text);
         }
@@ -1260,7 +1260,7 @@ impl MapView {
         let (w, h) = (tw + 12.0 * s, size * 1.25 + 6.0 * s);
         let (x, y) = (area[0] + area[2] - w - 6.0 * s, area[1] + area[3] - h - 6.0 * s);
         self.layer.quad(Quad::solid([x, y, w, h], [0.0, 0.0, 0.0, 0.55], 5.0 * s));
-        self.layer.text(Text::new(ATTRIBUTION, x + 6.0 * s, y + 3.0 * s, size).color(theme::TEXT_DIM));
+        self.layer.text(Text::new(ATTRIBUTION, x + 6.0 * s, y + 3.0 * s, size).color(theme::text_dim()));
         fading
     }
 }

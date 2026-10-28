@@ -516,7 +516,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.004, g: 0.004, b: 0.005, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(clear_color()),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -542,4 +542,11 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         self.ui.trim();
     }
+}
+
+/// The theme background, linearised for the (sRGB) render target.
+fn clear_color() -> wgpu::Color {
+    let [r, g, b, _] = crate::theme::rgba(crate::theme::bg(), 1.0);
+    let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } as f64;
+    wgpu::Color { r: lin(r), g: lin(g), b: lin(b), a: 1.0 }
 }

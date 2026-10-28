@@ -382,9 +382,9 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
 
 fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut crate::ui::Layer, s: f32, x0: f32, h: f32) {
     let width = WIDTH * s;
-    base.quad(Quad::solid([x0, 0.0, width, h], rgb(theme::SIDEBAR, 0.99), 0.0));
+    base.quad(Quad::solid([x0, 0.0, width, h], rgb(theme::sidebar(), 0.99), 0.0));
     let line = s.round().max(1.0);
-    base.quad(Quad::solid([x0 + width - line, 0.0, line, h], rgb(theme::SEPARATOR, 1.0), 0.0));
+    base.quad(Quad::solid([x0 + width - line, 0.0, line, h], rgb(theme::separator(), 1.0), 0.0));
     let clip = [x0, 0.0, width - line, h - FOOTER * s];
     let hover = sb.contains(sb.cursor, s).then_some(sb.cursor);
 
@@ -396,7 +396,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         let row = match item {
             Item::Header(label) => {
                 base.text(
-                    Text::new(*label, x0 + 20.0 * s, y + 15.0 * s, 11.5 * s).weight(600).color(theme::TEXT_FAINT).clip(clip),
+                    Text::new(*label, x0 + 20.0 * s, y + 15.0 * s, 11.5 * s).weight(600).color(theme::text_faint()).clip(clip),
                 );
                 continue;
             }
@@ -406,7 +406,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         let selected = row.key == sb.selected;
         let hovered = hover.is_some_and(|c| crate::ui::contains(pill, c.0, c.1));
         if selected {
-            base.quad(Quad::solid(pill, rgb(theme::ACCENT, 1.0), 7.0 * s));
+            base.quad(Quad::solid(pill, rgb(theme::accent(), 1.0), 7.0 * s));
         } else if hovered {
             // Opaque: a translucent white blended in linear space comes out far too bright.
             base.quad(Quad::solid(pill, rgb(0x2a2a2e, 1.0), 7.0 * s));
@@ -414,7 +414,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         let mid = y + ROW * s / 2.0;
         match row.look {
             Look::Icon(icon) => {
-                let color = if selected { theme::TEXT } else { [64, 156, 255, 255] };
+                let color = if selected { theme::text() } else { [64, 156, 255, 255] };
                 let size = 15.0 * s;
                 base.text(Text::new(icon, x0 + 31.0 * s, mid - size * 0.625, size).icon().color(color).align(Align::Center).clip(clip));
             }
@@ -432,7 +432,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         let right = x0 + width - 22.0 * s;
         let mut avail = right - (x0 + 52.0 * s);
         if let Some(count) = &row.count {
-            let color = if selected { [255, 255, 255, 200] } else { theme::TEXT_FAINT };
+            let color = if selected { [255, 255, 255, 200] } else { theme::text_faint() };
             base.text(Text::new(count.clone(), right, mid - count_size * 0.625, count_size).weight(500).color(color).align(Align::Right).clip(clip));
             avail -= uir.measure(count, count_size, 500, Font::Sans) + 10.0 * s;
         }
@@ -445,7 +445,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
                 l
             }
         };
-        let color = if selected { [255, 255, 255, 255] } else { theme::TEXT };
+        let color = if selected { [255, 255, 255, 255] } else { theme::text() };
         base.text(Text::new(label, x0 + 52.0 * s, mid - text_size * 0.625, text_size).weight(500).color(color).clip(clip));
     }
     draw_footer(sb, base, s, x0, h);
@@ -455,23 +455,23 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
 fn draw_footer(sb: &Sidebar, base: &mut crate::ui::Layer, s: f32, x0: f32, h: f32) {
     let (width, line) = (WIDTH * s, s.round().max(1.0));
     let top = h - FOOTER * s;
-    base.quad(Quad::solid([x0, top, width - line, FOOTER * s], rgb(theme::SIDEBAR, 1.0), 0.0));
+    base.quad(Quad::solid([x0, top, width - line, FOOTER * s], rgb(theme::sidebar(), 1.0), 0.0));
     if sb.content - sb.scroll > h / s - FOOTER {
-        base.quad(Quad::solid([x0, top, width - line, line], rgb(theme::SEPARATOR, 1.0), 0.0));
+        base.quad(Quad::solid([x0, top, width - line, line], rgb(theme::separator(), 1.0), 0.0));
     }
     let pill = [x0 + 10.0 * s, top + (FOOTER - ROW) / 2.0 * s, width - 20.0 * s, ROW * s];
     let selected = sb.selected == "settings";
     let hovered = sb.contains(sb.cursor, s) && crate::ui::contains(pill, sb.cursor.0, sb.cursor.1);
     if selected {
-        base.quad(Quad::solid(pill, rgb(theme::ACCENT, 1.0), 7.0 * s));
+        base.quad(Quad::solid(pill, rgb(theme::accent(), 1.0), 7.0 * s));
     } else if hovered {
         base.quad(Quad::solid(pill, rgb(0x2a2a2e, 1.0), 7.0 * s));
     }
     let mid = pill[1] + ROW * s / 2.0;
     let (icon, text) = (15.0 * s, 13.0 * s);
-    let color = if selected { theme::TEXT } else { [64, 156, 255, 255] };
+    let color = if selected { theme::text() } else { [64, 156, 255, 255] };
     base.text(Text::new("\u{f013}", x0 + 31.0 * s, mid - icon * 0.625, icon).icon().color(color).align(Align::Center));
-    let color = if selected { [255, 255, 255, 255] } else { theme::TEXT };
+    let color = if selected { [255, 255, 255, 255] } else { theme::text() };
     base.text(Text::new("Settings", x0 + 52.0 * s, mid - text * 0.625, text).weight(500).color(color));
 }
 

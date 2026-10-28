@@ -404,7 +404,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
         clip: [left, top, w - left, h - top],
         animating: false,
     };
-    ctx.quad(area, rgb(theme::BG, 1.0), 0.0);
+    ctx.quad(area, rgb(theme::bg(), 1.0), 0.0);
 
     let cw = (area[2] - 48.0 * s).min(MAX_WIDTH * s);
     let x = left + (area[2] - cw) / 2.0;
@@ -420,7 +420,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
         ctx.anims.insert(format!("section:{key}"), offset);
         let mid = *y + 14.0 * s;
         ctx.icon_tile(x + 2.0 * s, mid, glyph, color);
-        ctx.text(title, x + 36.0 * s, mid, 15.0, 700, theme::TEXT, Align::Left);
+        ctx.text(title, x + 36.0 * s, mid, 15.0, 700, theme::text(), Align::Left);
         *y += 38.0 * s;
     };
     let gap = 28.0 * s;
@@ -662,7 +662,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     };
     let dx = r[0] + 16.0 * s;
     ctx.quad([dx, mid - 12.5 * s, 8.0 * s, 8.0 * s], rgb(dot, 1.0), 4.0 * s);
-    ctx.text(status, dx + 15.0 * s, mid - 8.5 * s, 13.5, 500, theme::TEXT, Align::Left);
+    ctx.text(status, dx + 15.0 * s, mid - 8.5 * s, 13.5, 500, theme::text(), Align::Left);
     let sub_max = cw - 200.0 * s;
     let sub = ctx.ellipsize(&sub, 11.5, 400, sub_max);
     ctx.text(sub, dx, mid + 9.5 * s, 11.5, 400, colors::TEXT_SECONDARY, Align::Left);
@@ -716,19 +716,19 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     page.content = (y - (top - page.scroll * s)) / s;
 
     // Header over the scrolled content: opaque, with a hairline once something is beneath it.
-    ctx.quad([left, 0.0, w - left, top], rgb(theme::BG, 1.0), 0.0);
+    ctx.quad([left, 0.0, w - left, top], rgb(theme::bg(), 1.0), 0.0);
     if page.scroll > 1.0 {
         let line = s.round().max(1.0);
-        ctx.quad([left, top - line, w - left, line], rgb(theme::SEPARATOR, 1.0), 0.0);
+        ctx.quad([left, top - line, w - left, line], rgb(theme::separator(), 1.0), 0.0);
     }
     let animating = ctx.animating;
     let base = &mut core.ui.base;
     // Title lines up with the column when it's centred in a wide window.
     let tx = (x + 2.0 * s).max(left + 20.0 * s);
-    base.text(Text::new("Settings", tx, 14.0 * s, 26.0 * s).weight(700).color(theme::TEXT));
-    base.text(Text::new("Changes apply right away", tx, 48.0 * s, 13.0 * s).weight(500).color(theme::TEXT_DIM));
+    base.text(Text::new("Settings", tx, 14.0 * s, 26.0 * s).weight(700).color(theme::text()));
+    base.text(Text::new("Changes apply right away", tx, 48.0 * s, 13.0 * s).weight(500).color(theme::text_dim()));
     if !syncing.is_empty() {
-        let t = Text::new(syncing, w - 20.0 * s, 22.0 * s, 14.0 * s).weight(500).color(theme::TEXT_DIM).align(Align::Right);
+        let t = Text::new(syncing, w - 20.0 * s, 22.0 * s, 14.0 * s).weight(500).color(theme::text_dim()).align(Align::Right);
         base.text(t);
     }
     // Drawn after the sidebar, so move the page's quads underneath it.
@@ -803,7 +803,7 @@ fn storage_overview(ctx: &mut Ctx, r: [f32; 4], sizes: Option<&Sizes>, limit: u6
         return;
     };
     let total = z.total();
-    ctx.text(format_bytes(total), x, top + 10.0 * s, 20.0, 700, theme::TEXT, Align::Left);
+    ctx.text(format_bytes(total), x, top + 10.0 * s, 20.0, 700, theme::text(), Align::Left);
     let tw = ctx.measure(&format_bytes(total), 20.0, 700);
     ctx.text("used by Lumen on this computer", x + tw + 8.0 * s, top + 12.0 * s, 12.5, 400, colors::TEXT_SECONDARY, Align::Left);
     let lim = if limit == 0 { "Thumbnails: no limit".to_string() } else { format!("Thumbnails limited to {}", format_bytes(limit)) };

@@ -52,6 +52,7 @@ pub struct UiRenderer {
     atlas: TextAtlas,
     text: [TextRenderer; 3],
     buffers: HashMap<TextKey, (Buffer, f32)>,
+    icons: HashMap<crate::icons::IconKey, ImageId>,
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
@@ -167,6 +168,7 @@ impl UiRenderer {
             atlas,
             text,
             buffers: HashMap::new(),
+            icons: HashMap::new(),
         }
     }
 
@@ -244,6 +246,15 @@ impl UiRenderer {
     }
 
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame, size: (u32, u32)) {
+        // Rasterise icons seen for the first time (each size/weight once, then cached).
+        for q in frame.base.quads.iter().chain(&frame.overlay.quads).chain(&frame.popup.quads) {
+            if let Some(key) = q.icon.filter(|k| !self.icons.contains_key(k)) {
+                if let Some(px) = crate::icons::rasterize(key) {
+                    let id = self.create_image(device, queue, key.px as u32, key.px as u32, &px);
+                    self.icons.insert(key, id);
+                }
+            }
+        }
         // Quads for all layers go into one buffer; batches split by bound image.
         let mut all = Vec::new();
         for (li, layer) in [&frame.base, &frame.overlay, &frame.popup].into_iter().enumerate() {
@@ -251,14 +262,15 @@ impl UiRenderer {
             for q in &layer.quads {
                 let start = all.len() as u32;
                 let lin = [srgb_to_linear(q.color[0]), srgb_to_linear(q.color[1]), srgb_to_linear(q.color[2]), q.color[3]];
-                let has_image = q.image.is_some_and(|id| self.images.contains_key(&id));
+                let q_image = q.icon.and_then(|k| self.icons.get(&k).copied()).or(q.image);
+                let has_image = q_image.is_some_and(|id| self.images.contains_key(&id));
                 all.push(QuadInstance {
                     rect: q.rect,
                     color: lin,
                     uv: q.uv,
                     params: [q.radius, if has_image { 1.0 } else { 0.0 }, 0.0, 0.0],
                 });
-                let image = if has_image { q.image } else { None };
+                let image = if has_image { q_image } else { None };
                 match self.batches[li].last_mut() {
                     Some(b) if b.2 == image && b.1 == start => b.1 += 1,
                     _ => self.batches[li].push((start, start + 1, image)),

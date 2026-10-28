@@ -1074,7 +1074,7 @@ pub fn draw(core: &mut Core, now: Instant) -> bool {
 }
 
 fn button_bg(hovered: bool, on: bool, a: f32) -> [f32; 4] {
-    if on { rgb(theme::ACCENT, 0.9 * a) } else { rgb(0xffffff, if hovered { 0.24 } else { 0.14 } * a) }
+    if on { rgb(theme::accent(), 0.9 * a) } else { rgb(0xffffff, if hovered { 0.24 } else { 0.14 } * a) }
 }
 
 fn alpha(c: [u8; 4], a: f32) -> [u8; 4] {
@@ -1104,8 +1104,8 @@ fn draw_toolbar(core: &mut Core, out: &mut Layer) {
         out.quad(Quad::solid(rect, button_bg(hovered, on, ca), d / 2.0));
         let (icon, color) = match cmd {
             Cmd::Favorite(_) if favorite => ("\u{f004}", HEART),
-            Cmd::Favorite(_) => ("\u{f08a}", theme::TEXT),
-            c => (c.icon(), theme::TEXT),
+            Cmd::Favorite(_) => ("\u{f08a}", theme::text()),
+            c => (c.icon(), theme::text()),
         };
         out.text(Text::new(icon, x + d / 2.0, rect[1] + d / 2.0 - 10.0 * s, 16.0 * s).icon().align(Align::Center).color(alpha(color, ca)));
         core.actions.hits.push((Hit::Toolbar(cmd), rect));
@@ -1136,7 +1136,7 @@ fn draw_bar(core: &mut Core, out: &mut Layer, x0: f32, gw: f32, bottom: f32) -> 
     out.quad(Quad::solid([bx - 1.0, by - 1.0, total + 2.0, bh + 2.0], rgb(0x3a3a3c, 0.9), bh / 2.0 + 1.0));
     out.quad(Quad::solid(bar, rgb(0x1c1c1e, 0.97), bh / 2.0));
     let cy = by + bh / 2.0;
-    out.text(Text::new(label, bx + 18.0 * s, cy - size * 0.625, size).weight(600).color(theme::TEXT));
+    out.text(Text::new(label, bx + 18.0 * s, cy - size * 0.625, size).weight(600).color(theme::text()));
     let mut x = bx + 18.0 * s + lw + 14.0 * s;
     let cursor = core.actions.cursor;
     for (cmd, bw) in cmds.into_iter().zip(widths) {
@@ -1146,13 +1146,13 @@ fn draw_bar(core: &mut Core, out: &mut Layer, x0: f32, gw: f32, bottom: f32) -> 
         }
         match cmd {
             Cmd::Clear => {
-                out.text(Text::new(cmd.icon(), x + bw / 2.0, cy - isize * 0.625, isize).icon().align(Align::Center).color(theme::TEXT_DIM));
+                out.text(Text::new(cmd.icon(), x + bw / 2.0, cy - isize * 0.625, isize).icon().align(Align::Center).color(theme::text_dim()));
             }
             _ => {
                 let heart = matches!(cmd, Cmd::Favorite(false));
-                let color = if heart { HEART } else { theme::TEXT };
+                let color = if heart { HEART } else { theme::text() };
                 out.text(Text::new(cmd.icon(), x + 12.0 * s, cy - isize * 0.625, isize).icon().color(color));
-                out.text(Text::new(bar_label(cmd), x + 12.0 * s + isize + 7.0 * s, cy - size * 0.625, size).weight(500).color(theme::TEXT));
+                out.text(Text::new(bar_label(cmd), x + 12.0 * s + isize + 7.0 * s, cy - size * 0.625, size).weight(500).color(theme::text()));
             }
         }
         core.actions.hits.push((Hit::Bar(cmd), rect));
@@ -1191,7 +1191,7 @@ fn draw_toast(core: &mut Core, out: &mut Layer, cx: f32, bottom: f32, now: Insta
     let cy = y + th / 2.0;
     let ic = if t.error { ERROR } else { [48, 209, 88, 255] };
     out.text(Text::new(icon, x + 18.0 * s, cy - 13.0 * s * 0.625, 13.0 * s).icon().color(alpha(ic, a)));
-    let color = if t.error { ERROR } else { theme::TEXT };
+    let color = if t.error { ERROR } else { theme::text() };
     out.text(Text::new(t.text.clone(), x + 40.0 * s, cy - size * 0.625, size).weight(500).max_width(tw + 1.0).color(alpha(color, a)));
     if t.undo.is_some() {
         let ux = x + 40.0 * s + tw + 10.0 * s;
@@ -1236,7 +1236,7 @@ fn draw_menu(core: &mut Core, out: &mut Layer) {
         let r = [x + pad, cy, width - pad * 2.0, row];
         let hovered = contains(r, cursor.0, cursor.1);
         if hovered {
-            out.quad(Quad::solid(r, rgb(theme::ACCENT, 1.0), 6.0 * s));
+            out.quad(Quad::solid(r, rgb(theme::accent(), 1.0), 6.0 * s));
         }
         let icon = match cmd {
             Cmd::Favorite(_) if favorite => "\u{f004}",
@@ -1244,7 +1244,7 @@ fn draw_menu(core: &mut Core, out: &mut Layer) {
             c => c.icon(),
         };
         let mid = cy + row / 2.0;
-        let ic = if matches!(cmd, Cmd::Favorite(_)) && favorite && !hovered { HEART } else { theme::TEXT };
+        let ic = if matches!(cmd, Cmd::Favorite(_)) && favorite && !hovered { HEART } else { theme::text() };
         out.text(Text::new(icon, x + 22.0 * s, mid - 13.0 * s * 0.625, 13.0 * s).icon().align(Align::Center).color(ic));
         out.text(Text::new(label(*cmd), x + 40.0 * s, mid - size * 0.625, size).weight(500).color([255, 255, 255, 240]));
         hits.push((Hit::Item(i), r));
@@ -1277,8 +1277,8 @@ fn draw_picker(core: &mut Core, out: &mut Layer) {
     out.quad(Quad::solid([0.0, 0.0, w, h], rgb(0x000000, 0.45), 0.0));
     out.quad(Quad::solid([x - 1.0, y - 1.0, sw + 2.0, sh + 2.0], rgb(0x48484a, 0.9), 14.0 * s + 1.0));
     out.quad(Quad::solid(sheet, rgb(0x1c1c1e, 1.0), 14.0 * s));
-    out.text(Text::new("Add to Album", x + 20.0 * s, y + 16.0 * s, 17.0 * s).weight(700).color(theme::TEXT));
-    out.text(Text::new(targets, x + 20.0 * s, y + 40.0 * s, 12.5 * s).weight(500).color(theme::TEXT_DIM));
+    out.text(Text::new("Add to Album", x + 20.0 * s, y + 16.0 * s, 17.0 * s).weight(700).color(theme::text()));
+    out.text(Text::new(targets, x + 20.0 * s, y + 40.0 * s, 12.5 * s).weight(500).color(theme::text_dim()));
     let cancel = [x + sw - 84.0 * s, y + 12.0 * s, 70.0 * s, 30.0 * s];
     out.text(Text::new("Cancel", cancel[0] + cancel[2] - 6.0 * s, y + 18.0 * s, 13.5 * s).weight(500).align(Align::Right).color(ACCENT_TEXT));
 
@@ -1286,15 +1286,15 @@ fn draw_picker(core: &mut Core, out: &mut Layer) {
     out.quad(Quad::solid(field, rgb(0x2c2c2e, 1.0), 8.0 * s));
     let fs = 14.0 * s;
     let ty = field[1] + field[3] / 2.0 - fs * 0.625;
-    out.text(Text::new("\u{f002}", field[0] + 12.0 * s, ty + 1.0 * s, 12.0 * s).icon().color(theme::TEXT_FAINT));
+    out.text(Text::new("\u{f002}", field[0] + 12.0 * s, ty + 1.0 * s, 12.0 * s).icon().color(theme::text_faint()));
     let tx = field[0] + 34.0 * s;
     let tw = core.renderer.ui.measure(&text, fs, 400, Font::Sans);
     if text.is_empty() {
-        out.text(Text::new("Search, or name a new album", tx, ty, fs).color(theme::TEXT_FAINT));
+        out.text(Text::new("Search, or name a new album", tx, ty, fs).color(theme::text_faint()));
     } else {
-        out.text(Text::new(text.clone(), tx, ty, fs).color(theme::TEXT).clip(field));
+        out.text(Text::new(text.clone(), tx, ty, fs).color(theme::text()).clip(field));
     }
-    out.quad(Quad::solid([tx + tw + 1.0 * s, field[1] + 8.0 * s, 1.5 * s, field[3] - 16.0 * s], rgb(theme::ACCENT, 1.0), 0.0));
+    out.quad(Quad::solid([tx + tw + 1.0 * s, field[1] + 8.0 * s, 1.5 * s, field[3] - 16.0 * s], rgb(theme::accent(), 1.0), 0.0));
 
     let list = [x + 8.0 * s, y + 110.0 * s, sw - 16.0 * s, sh - 118.0 * s];
     let rh = 50.0 * s;
@@ -1337,14 +1337,14 @@ fn draw_picker(core: &mut Core, out: &mut Layer) {
                 _ => {}
             }
             let tx = thumb[0] + 50.0 * s;
-            out.text(clip_text(Text::new(name.clone(), tx, mid - 17.0 * s, 14.0 * s).weight(500).max_width(list[2] - 80.0 * s).color(theme::TEXT)));
+            out.text(clip_text(Text::new(name.clone(), tx, mid - 17.0 * s, 14.0 * s).weight(500).max_width(list[2] - 80.0 * s).color(theme::text())));
             let c = format!("{} item{}", group(*count), if *count == 1 { "" } else { "s" });
-            out.text(clip_text(Text::new(c, tx, mid + 2.0 * s, 12.0 * s).weight(500).color(theme::TEXT_FAINT)));
+            out.text(clip_text(Text::new(c, tx, mid + 2.0 * s, 12.0 * s).weight(500).color(theme::text_faint())));
         }
         hits.push((Hit::Row(r), vis));
     }
     if rows == 1 && !text.trim().is_empty() {
-        out.text(Text::new("No albums match", list[0] + list[2] / 2.0, list[1] + rh + 20.0 * s, 13.0 * s).align(Align::Center).color(theme::TEXT_FAINT));
+        out.text(Text::new("No albums match", list[0] + list[2] / 2.0, list[1] + rh + 20.0 * s, 13.0 * s).align(Align::Center).color(theme::text_faint()));
     }
     core.actions.hits.push((Hit::Cancel, cancel));
     core.actions.hits.extend(hits);
