@@ -1,5 +1,6 @@
 //! Fullscreen photo viewer: grows out of a grid tile, loads progressively (thumbhash →
 //! thumbnail → preview → original on deep zoom), and lets you zoom, pan and page through.
+//! Videos autoplay in place over their poster (see `video.rs`) with an auto-hiding controls bar.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
@@ -17,7 +18,8 @@ use crate::grid::{Layout, Spec};
 use crate::library::{self, Library};
 use crate::loader::{Loader, Source, thumbnail_bytes};
 use crate::render::Renderer;
-use crate::ui::{Align, Layer, Quad, Text, contains, rgb, theme};
+use crate::ui::{Align, ImageId, Layer, Quad, Text, contains, rgb, theme};
+use crate::video::{self, Player};
 
 const OPEN_TIME: f32 = 0.30;
 const CLOSE_TIME: f32 = 0.28;
@@ -30,6 +32,12 @@ const CHROME_IDLE: Duration = Duration::from_secs(2);
 const KEEP: usize = 2;
 /// Decoded originals are capped here to bound GPU memory (~130 MB with mips).
 const FULL_MAX: u32 = 6144;
+/// Video frames are scaled down in the pipeline to at most this (or the window) per side.
+const VIDEO_MAX: u32 = 1920;
+/// Arrow-key seek step.
+const SEEK_STEP: f64 = 5.0;
+/// How long the first frame may take before the spinner shows.
+const SPINNER_AFTER: Duration = Duration::from_millis(250);
 
 const HASH: usize = 0;
 const THUMB: usize = 1;
@@ -124,6 +132,47 @@ enum Hit {
     Info,
     Play,
     Panel,
+    /// Video controls: play/pause, timeline, mute, volume, and the bar itself.
+    Toggle,
+    Scrub,
+    Mute,
+    Volume,
+    Bar,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    Scrub,
+    Volume,
+}
+
+/// The one video playing in the viewer, if any.
+struct Playback {
+    id: String,
+    /// None when the pipeline couldn't be built (then Space opens mpv instead).
+    player: Option<Player>,
+    tex: Option<(ImageId, u32, u32)>,
+    /// When the first frame was uploaded; the poster crossfades to video from here.
+    shown_at: Option<Instant>,
+    started: Instant,
+    /// Timeline position while scrubbing, and whether to resume playing afterwards.
+    scrub: Option<(f64, bool)>,
+}
+
+impl Playback {
+    fn player(&mut self) -> Option<&mut Player> {
+        self.player.as_mut().filter(|p| !p.failed)
+    }
+
+    /// Position shown on the timeline: the scrub target while dragging.
+    fn position(&self) -> f64 {
+        let Some(p) = &self.player else { return 0.0 };
+        match self.scrub {
+            Some((t, _)) => t,
+            None if p.ended => p.duration().unwrap_or(0.0),
+            None => p.position().unwrap_or(0.0),
+        }
+    }
 }
 
 struct Open {
@@ -167,6 +216,15 @@ pub struct Viewer {
     last_tick: Instant,
     /// Keeps the chrome visible regardless of mouse activity (headless screenshots).
     pub hold_chrome: bool,
+    video: Option<Playback>,
+    /// Start videos as soon as they're shown (off in headless mode unless asked).
+    pub autoplay: bool,
+    /// Discard video audio (headless tests shouldn't make noise).
+    pub silent: bool,
+    muted: bool,
+    volume: f64,
+    drag: Option<Drag>,
+    play_request: Option<f64>,
 }
 
 /// What headless screenshot mode should show.
@@ -177,16 +235,23 @@ pub struct Shot {
     pub next: i32,
     pub zoom: Option<f32>,
     pub close_at: Option<u64>,
+    /// Play the (video) asset from this many seconds and show it once a frame is up.
+    pub play_at: Option<f64>,
+    /// Instead of waiting for that frame, render after this many ms (buffering state).
+    pub play_wait: Option<u64>,
 }
 
 impl Shot {
-    /// "newest", "oldest", an index, or a negative index from the newest end.
-    pub fn index(&self, n: usize) -> usize {
-        let last = n.saturating_sub(1) as i64;
+    /// "newest", "oldest", an asset id, an index, or a negative index from the newest end.
+    pub fn index(&self, lib: &Library) -> usize {
+        let last = lib.len().saturating_sub(1) as i64;
         let i = match self.at.as_str() {
             "newest" => last,
             "oldest" => 0,
-            s => s.parse::<i64>().map_or(last, |i| if i < 0 { last + 1 + i } else { i }),
+            s => match lib.assets.iter().position(|a| a.id == s) {
+                Some(i) => i as i64,
+                None => s.parse::<i64>().map_or(last, |i| if i < 0 { last + 1 + i } else { i }),
+            },
         };
         i.clamp(0, last) as usize
     }
@@ -206,6 +271,13 @@ impl Viewer {
             queue: VecDeque::new(),
             last_tick: Instant::now(),
             hold_chrome: false,
+            video: None,
+            autoplay: true,
+            silent: false,
+            muted: false,
+            volume: 1.0,
+            drag: None,
+            play_request: None,
         }
     }
 
@@ -340,6 +412,10 @@ impl Viewer {
                     o.active_at = now;
                 }
                 o.cursor = p;
+                if let Some(drag) = self.drag {
+                    self.drag_to(drag, false);
+                    return true;
+                }
                 if let Some((start, pan)) = o.press {
                     o.dragged |= (p.0 - start.0).abs() + (p.1 - start.1).abs() > 5.0;
                     if o.dragged && o.zoom > 1.001 {
@@ -353,10 +429,27 @@ impl Viewer {
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } if !closing => {
                 match state {
                     ElementState::Pressed => {
-                        o.press = Some((o.cursor, o.pan));
-                        o.dragged = false;
+                        let p = o.cursor;
+                        let hit = o.hits.iter().find(|(_, r)| contains(*r, p.0, p.1)).map(|h| h.0);
+                        let drag = match hit {
+                            Some(Hit::Scrub) => Some(Drag::Scrub),
+                            Some(Hit::Volume) => Some(Drag::Volume),
+                            _ => None,
+                        };
+                        if let Some(d) = drag {
+                            o.active_at = now;
+                            self.drag = Some(d);
+                            self.drag_to(d, false);
+                        } else {
+                            o.press = Some((o.cursor, o.pan));
+                            o.dragged = false;
+                        }
                     }
                     ElementState::Released => {
+                        if let Some(d) = self.drag.take() {
+                            self.drag_to(d, true);
+                            return true;
+                        }
                         let clicked = o.press.take().is_some() && !o.dragged;
                         if clicked {
                             self.click(now);
@@ -404,11 +497,19 @@ impl Viewer {
                 }
                 o.active_at = now;
                 let center = (o.screen.0 / 2.0, o.screen.1 / 2.0);
+                // While a video plays, plain arrows seek and Shift+arrows (or Page Up/Down) page.
+                let video = self.video.as_ref().is_some_and(|v| v.player.is_some());
+                let shift = mods.shift_key();
                 match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Escape | NamedKey::Backspace) => self.close(now),
-                    Key::Named(NamedKey::ArrowLeft) => self.go(-1, now),
-                    Key::Named(NamedKey::ArrowRight) => self.go(1, now),
+                    Key::Named(NamedKey::ArrowLeft) if video && !shift => self.seek_by(-SEEK_STEP),
+                    Key::Named(NamedKey::ArrowRight) if video && !shift => self.seek_by(SEEK_STEP),
+                    Key::Named(NamedKey::ArrowLeft | NamedKey::PageUp) => self.go(-1, now),
+                    Key::Named(NamedKey::ArrowRight | NamedKey::PageDown) => self.go(1, now),
+                    Key::Named(NamedKey::ArrowUp) if video => self.set_volume(self.volume + 0.1),
+                    Key::Named(NamedKey::ArrowDown) if video => self.set_volume(self.volume - 0.1),
                     Key::Named(NamedKey::Space | NamedKey::Enter) => self.play(),
+                    Key::Character("m") => self.toggle_mute(),
                     Key::Character("i") => o.panel = !o.panel,
                     Key::Character("=" | "+") => o.zoom_by(1.5, center),
                     Key::Character("-" | "_") => o.zoom_by(1.0 / 1.5, center),
@@ -431,8 +532,9 @@ impl Viewer {
         match o.hits.iter().find(|(_, r)| contains(*r, p.0, p.1)).map(|h| h.0) {
             Some(Hit::Close) => self.close(now),
             Some(Hit::Info) => o.panel = !o.panel,
-            Some(Hit::Play) => self.play(),
-            Some(Hit::Panel) => {}
+            Some(Hit::Play | Hit::Toggle) => self.play(),
+            Some(Hit::Mute) => self.toggle_mute(),
+            Some(Hit::Panel | Hit::Bar | Hit::Scrub | Hit::Volume) => {}
             None if contains(o.clip, p.0, p.1) => {
                 let double = o.last_click.is_some_and(|(t, q)| {
                     now.duration_since(t) < Duration::from_millis(350) && (q.0 - p.0).abs() + (q.1 - p.1).abs() < 10.0
@@ -449,28 +551,178 @@ impl Viewer {
         }
     }
 
-    /// Streams a video in mpv; the viewer itself only shows the poster.
+    /// Play/pause for the current video; starts it if it isn't loaded yet.
     fn play(&mut self) {
         let Some(o) = &self.open else { return };
         let asset = &o.lib.assets[o.index];
-        let Source::Immich(immich) = &self.source else { return };
         if !asset.video {
             return;
         }
-        let url = format!("{}/api/assets/{}/video/playback", immich.base(), asset.id);
-        let spawned = std::process::Command::new("mpv")
-            .arg(format!("--http-header-fields=x-api-key: {}", immich.api_key()))
-            .arg("--force-window=immediate")
-            .arg(format!("--title={}", asset.taken.get(..10).unwrap_or("Video")))
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        match spawned {
-            // Reap it in the background so it doesn't linger as a zombie.
-            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
-            Err(e) => log::warn!("couldn't start mpv: {e}"),
+        let (id, screen) = (asset.id.clone(), o.screen);
+        match self.video.as_mut().filter(|v| v.id == id) {
+            Some(v) => {
+                if let Some(p) = v.player() {
+                    let on = !p.is_playing();
+                    p.set_playing(on);
+                }
+            }
+            None if video::available() => self.start_video(id, None, screen),
+            None => {}
+        }
+    }
+
+    /// Headless: (re)starts the current video from `t` seconds on the next update.
+    pub fn play_at(&mut self, t: f64) {
+        self.play_request = Some(t);
+    }
+
+    /// Headless: a frame at or past `t` is on screen (faded in) and the pipeline reached PLAYING.
+    pub fn video_ready(&self, t: f64) -> bool {
+        let Some(v) = &self.video else { return false };
+        let Some(p) = &v.player else { return true };
+        let faded = v.shown_at.is_some_and(|at| at.elapsed().as_secs_f32() > FADE_TIME);
+        p.failed || (faded && p.reached_playing() && p.last_pts >= t - 0.25)
+    }
+
+    /// Headless: one line about the current video, for test logs.
+    pub fn video_status(&self) -> String {
+        let Some(v) = &self.video else { return "video: none".into() };
+        let Some(p) = &v.player else { return "video: no pipeline".into() };
+        let size = v.tex.map_or("none".into(), |(_, w, h)| format!("{w}x{h}"));
+        format!(
+            "video: frame {size} pts {:.2}s, position {:.2}s of {:.2}s, {} frames, playing {}, buffering {}, failed {}",
+            p.last_pts,
+            v.position(),
+            p.duration().unwrap_or(0.0),
+            p.frames,
+            p.reached_playing(),
+            p.buffering(),
+            p.failed
+        )
+    }
+
+    fn start_video(&mut self, id: String, start_at: Option<f64>, screen: (f32, f32)) {
+        let Source::Immich(immich) = &self.source else { return };
+        let opts = video::Options {
+            max_side: (screen.0.max(screen.1) as u32).min(VIDEO_MAX),
+            silent: self.silent,
+            start_at,
+            muted: self.muted,
+            volume: self.volume,
+        };
+        let uri = format!("{}/api/assets/{id}/video/playback", immich.base());
+        let player = match Player::new(&uri, immich.api_key(), opts, self.wake.clone()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!("video: {e:#}");
+                None
+            }
+        };
+        self.video = Some(Playback { id, player, tex: None, shown_at: None, started: Instant::now(), scrub: None });
+    }
+
+    /// Starts, restarts or stops playback to match what's on screen, and uploads new frames.
+    fn sync_video(&mut self, o: &Open, now: Instant, r: &mut Renderer) {
+        let asset = &o.lib.assets[o.index];
+        let wanted = asset.video && !matches!(o.phase, Phase::Closing { .. } | Phase::Waiting(_));
+        if self.video.as_ref().is_some_and(|v| v.id != asset.id || !wanted) {
+            self.stop_video(r);
+        }
+        if let Some(t) = self.play_request.take().filter(|_| wanted && video::available()) {
+            self.stop_video(r);
+            self.start_video(asset.id.clone(), Some(t), o.screen);
+        }
+        if wanted && self.video.is_none() && self.autoplay && video::available() {
+            self.start_video(asset.id.clone(), None, o.screen);
+        }
+        let Some(v) = &mut self.video else { return };
+        let Some(p) = &mut v.player else { return };
+        p.tick();
+        if p.retry {
+            // The hardware decoder failed mid-stream: rebuild on software decoders where we were.
+            let at = p.position();
+            let id = v.id.clone();
+            self.stop_video(r);
+            self.start_video(id, at, o.screen);
+            return;
+        }
+        // Reallocate the texture only when the frame size changes.
+        p.take_frame(|w, h, rgba| {
+            match v.tex {
+                Some((tex, tw, th)) if (tw, th) == (w, h) => r.ui.update_image(&r.queue, tex, rgba),
+                old => {
+                    if let Some((tex, _, _)) = old {
+                        r.ui.free_image(tex);
+                    }
+                    v.tex = Some((r.ui.create_frame_image(&r.device, &r.queue, w, h, rgba), w, h));
+                }
+            }
+            v.shown_at.get_or_insert(now);
+        });
+    }
+
+    fn stop_video(&mut self, r: &mut Renderer) {
+        self.drag = None;
+        if let Some(v) = self.video.take()
+            && let Some((tex, _, _)) = v.tex
+        {
+            r.ui.free_image(tex);
+        }
+    }
+
+    fn seek_by(&mut self, dt: f64) {
+        let Some(v) = &mut self.video else { return };
+        let t = v.position();
+        if let Some(p) = v.player() {
+            p.seek(t + dt, true);
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        if let Some(p) = self.video.as_mut().and_then(|v| v.player()) {
+            p.set_mute(self.muted);
+        }
+    }
+
+    fn set_volume(&mut self, v: f64) {
+        self.volume = v.clamp(0.0, 1.0);
+        if self.muted && self.volume > 0.0 {
+            self.toggle_mute();
+        }
+        if let Some(p) = self.video.as_mut().and_then(|v| v.player()) {
+            p.set_volume(self.volume);
+        }
+    }
+
+    /// Scrubber/volume drag to the cursor. Scrubbing pauses and seeks to keyframes as you go,
+    /// then lands exactly where you let go and resumes.
+    fn drag_to(&mut self, drag: Drag, done: bool) {
+        let Some(o) = &self.open else { return };
+        let target = if drag == Drag::Scrub { Hit::Scrub } else { Hit::Volume };
+        let Some(&(_, rect)) = o.hits.iter().find(|h| h.0 == target) else { return };
+        let f = ((o.cursor.0 - rect[0]) / rect[2].max(1.0)).clamp(0.0, 1.0) as f64;
+        if drag == Drag::Volume {
+            return self.set_volume(f);
+        }
+        let Some(v) = &mut self.video else { return };
+        let resume = match v.scrub {
+            Some((_, resume)) => resume,
+            None => v.player().is_some_and(|p| p.is_playing() || p.ended),
+        };
+        let Some(p) = v.player.as_mut().filter(|p| !p.failed) else { return };
+        let Some(d) = p.duration() else { return };
+        let t = f * d;
+        if done {
+            v.scrub = None;
+            p.seek(t, true);
+            p.set_playing(resume);
+        } else {
+            if p.is_playing() {
+                p.set_playing(false);
+            }
+            v.scrub = Some((t, resume));
+            p.seek(t, false);
         }
     }
 
@@ -490,6 +742,7 @@ impl Viewer {
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
         let Some(mut o) = self.open.take() else {
+            self.stop_video(r);
             if !self.slots.is_empty() {
                 self.free_all(r);
             }
@@ -520,6 +773,7 @@ impl Viewer {
         let current = o.lib.assets[o.index].id.clone();
 
         self.receive(r, &current, now);
+        self.sync_video(&o, now, r);
 
         // Phase transitions.
         let slot = self.slots.get(&current);
@@ -529,6 +783,7 @@ impl Viewer {
             }
             Phase::Opening(t) if now.duration_since(t).as_secs_f32() >= OPEN_TIME => o.phase = Phase::Shown,
             Phase::Closing { start, .. } if now.duration_since(start).as_secs_f32() >= CLOSE_TIME => {
+                self.stop_video(r);
                 self.free_all(r);
                 return true;
             }
@@ -695,7 +950,11 @@ impl Viewer {
     }
 
     fn aspect(&self, lib: &Library, i: usize) -> f32 {
-        let slot = self.slots.get(&lib.assets[i].id);
+        let id = &lib.assets[i].id;
+        if let Some((_, w, h)) = self.video.as_ref().filter(|v| &v.id == id).and_then(|v| v.tex) {
+            return (w as f32 / h as f32).clamp(0.05, 20.0);
+        }
+        let slot = self.slots.get(id);
         match slot.and_then(|s| s.tex[PREVIEW].as_ref().or(s.tex[FULL].as_ref())) {
             Some(t) => t.w as f32 / t.h as f32,
             None => lib.assets[i].ratio,
@@ -708,12 +967,7 @@ impl Viewer {
         if clip[2] <= 0.0 || clip[3] <= 0.0 || img[2] <= 0.0 || img[3] <= 0.0 {
             return false;
         }
-        let uv = [
-            (clip[0] - img[0]) / img[2],
-            (clip[1] - img[1]) / img[3],
-            (clip[0] + clip[2] - img[0]) / img[2],
-            (clip[1] + clip[3] - img[1]) / img[3],
-        ];
+        let uv = uv_of(img, clip);
         let Some(slot) = self.slots.get(id) else { return false };
         let fade = |t: &Tex| (now.duration_since(t.at).as_secs_f32() / FADE_TIME).min(1.0);
         let base = (0..4).rev().find(|&k| slot.tex[k].as_ref().is_some_and(|t| fade(t) >= 1.0));
@@ -835,6 +1089,16 @@ impl Viewer {
         }
         let mv = |r: [f32; 4]| [r[0] + dx, r[1], r[2], r[3]];
         busy |= self.draw_asset(out, &asset.id, mv(img), mv(clip), alpha, now);
+        let playback = self.video.as_ref().filter(|v| v.id == asset.id);
+        if let Some(v) = playback
+            && let (Some((tex, _, _)), Some(at)) = (v.tex, v.shown_at)
+            && clip[2] > 0.0
+            && clip[3] > 0.0
+        {
+            let f = (now.duration_since(at).as_secs_f32() / FADE_TIME).min(1.0);
+            busy |= f < 1.0;
+            out.quad(Quad::image(mv(clip), tex, uv_of(img, clip), alpha * ease_out(f), 0.0));
+        }
 
         // Chrome fades with the open/close progress and after a while without the mouse.
         let progress = match o.phase {
@@ -844,7 +1108,9 @@ impl Viewer {
             _ => backdrop * backdrop,
         };
         let idle = now.duration_since(o.active_at) > CHROME_IDLE;
-        let target = if self.hold_chrome || o.panel || !idle { 1.0 } else { 0.0 };
+        let paused = playback.and_then(|v| v.player.as_ref()).is_some_and(|p| !p.is_playing() && !p.failed);
+        let held = self.hold_chrome || o.panel || paused || self.drag.is_some();
+        let target = if held || !idle { 1.0 } else { 0.0 };
         o.chrome += (target - o.chrome) * (1.0 - (-dt * 9.0).exp());
         if (target - o.chrome).abs() < 0.01 {
             o.chrome = target;
@@ -852,7 +1118,7 @@ impl Viewer {
             busy = true;
         }
         // Wake up in time to fade the chrome out.
-        busy |= target > 0.0 && !self.hold_chrome && !o.panel;
+        busy |= target > 0.0 && !held;
         o.hits.clear();
         let ca = o.chrome * progress;
         if ca > 0.003 {
@@ -863,19 +1129,56 @@ impl Viewer {
             }
         }
         if asset.video && progress > 0.0 {
-            let c = (w / 2.0 + dx, h / 2.0);
+            busy |= self.draw_video_overlay(o, playback, progress, ca, dx, s, now, r, out);
+        }
+        busy
+    }
+
+    /// The big centre button (before playing, paused, ended), the buffering spinner and,
+    /// with the chrome, the controls bar.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_video_overlay(
+        &self,
+        o: &mut Open,
+        playback: Option<&Playback>,
+        progress: f32,
+        ca: f32,
+        dx: f32,
+        s: f32,
+        now: Instant,
+        r: &mut Renderer,
+        out: &mut Layer,
+    ) -> bool {
+        let (w, h) = o.screen;
+        let c = (w / 2.0 + dx, h / 2.0);
+        let player = playback.and_then(|v| v.player.as_ref());
+        let failed = player.is_none_or(|p| p.failed) && playback.is_some() || !video::available();
+        let mut busy = false;
+
+        let waiting = playback.is_some_and(|v| v.scrub.is_none() && now.duration_since(v.started) > SPINNER_AFTER);
+        if !failed && waiting && player.is_some_and(|p| p.buffering() && (p.is_playing() || p.frames == 0)) {
+            busy = true;
+            spinner(out, c, 15.0 * s, progress, now);
+        } else if failed || player.is_none_or(|p| !p.is_playing()) {
             let rad = 38.0 * s;
             let rect = [c.0 - rad, c.1 - rad, rad * 2.0, rad * 2.0];
             out.quad(Quad::solid(rect, rgb(0x000000, 0.45 * progress), rad));
             out.quad(Quad::solid(rect, rgb(0xffffff, 0.12 * progress), rad));
+            let (glyph, nudge) = if player.is_some_and(|p| p.ended) { ("\u{f01e}", 0.0) } else { ("\u{f04b}", 3.0) };
             out.text(
-                Text::new("\u{f04b}", c.0 + 3.0 * s, c.1 - 19.0 * s, 30.0 * s)
+                Text::new(glyph, c.0 + nudge * s, c.1 - 19.0 * s, 30.0 * s)
                     .icon()
                     .align(Align::Center)
                     .color(fade_color(theme::TEXT, progress)),
             );
-            if let Some(d) = self.slots.get(&asset.id).and_then(|s| s.info.as_ref()?.duration.as_ref()) {
-                let label = format_duration(d);
+            let label = if failed {
+                Some("Can't play this video".to_string())
+            } else if playback.is_none() {
+                self.slots.get(&o.lib.assets[o.index].id).and_then(|s| s.info.as_ref()?.duration.as_ref()).map(format_duration)
+            } else {
+                None
+            };
+            if let Some(label) = label {
                 out.text(
                     Text::new(label, c.0, c.1 + rad + 10.0 * s, 13.0 * s)
                         .weight(600)
@@ -883,9 +1186,85 @@ impl Viewer {
                         .color(fade_color(theme::TEXT, progress)),
                 );
             }
-            o.hits.push((Hit::Play, rect));
+            if !failed {
+                o.hits.push((Hit::Play, rect));
+            }
+        }
+        if let Some(v) = playback.filter(|_| ca > 0.003 && !failed) {
+            self.draw_controls(o, v, ca, s, r, out);
         }
         busy
+    }
+
+    /// Apple-style floating bar: play/pause, elapsed, timeline, remaining, mute, volume.
+    fn draw_controls(&self, o: &mut Open, v: &Playback, ca: f32, s: f32, r: &mut Renderer, out: &mut Layer) {
+        let Some(p) = &v.player else { return };
+        let (w, h) = o.screen;
+        let (bw, bh) = ((w - 32.0 * s).min(680.0 * s), 46.0 * s);
+        let bar = [(w - bw) / 2.0, h - bh - 24.0 * s, bw, bh];
+        let (x, cy) = (bar[0], bar[1] + bh / 2.0);
+        out.quad(Quad::solid(bar, rgb(0x1c1c1e, 0.82 * ca), bh / 2.0));
+        let text = |c: [u8; 4]| fade_color(c, ca);
+        let icon = |out: &mut Layer, cx: f32, glyph: &str, size: f32| {
+            out.text(Text::new(glyph, cx, cy - size * 0.625, size).icon().align(Align::Center).color(text(theme::TEXT)));
+        };
+
+        let toggle = [x + 8.0 * s, cy - 17.0 * s, 34.0 * s, 34.0 * s];
+        let (glyph, nudge) = match () {
+            _ if p.is_playing() => ("\u{f04c}", 0.0),
+            _ if p.ended => ("\u{f01e}", 0.0),
+            _ => ("\u{f04b}", 1.5),
+        };
+        icon(out, toggle[0] + toggle[2] / 2.0 + nudge * s, glyph, 17.0 * s);
+
+        // Until the pipeline knows, the server's figure keeps the timeline from reading 0:00.
+        let details = self.slots.get(&v.id).and_then(|s| s.info.as_ref()?.duration.as_ref());
+        let duration = p.duration().or(details.map(duration_secs)).unwrap_or(0.0);
+        let pos = v.position().min(duration.max(0.0));
+        let (elapsed, remaining) = (clock(pos), format!("-{}", clock((duration - pos).max(0.0))));
+        // Width of the widest string of this shape, so the timeline doesn't wobble as digits change.
+        let size = 12.5 * s;
+        let slot = |r: &mut Renderer, t: &str| {
+            let shape: String = t.chars().map(|c| if c.is_ascii_digit() { '0' } else { c }).collect();
+            r.ui.measure(&shape, size, 600, crate::ui::Font::Sans)
+        };
+        let (ew, rw) = (slot(r, &elapsed), slot(r, &remaining));
+        let ty = cy - size * 0.625;
+        let ex = x + 50.0 * s;
+        out.text(Text::new(elapsed, ex, ty, size).weight(600).color(text(theme::TEXT_DIM)));
+
+        let vol_w = 64.0 * s;
+        let vol = [x + bw - 18.0 * s - vol_w, bar[1], vol_w, bh];
+        let mute_cx = vol[0] - 18.0 * s;
+        let rx = mute_cx - 20.0 * s;
+        out.text(Text::new(remaining, rx, ty, size).weight(600).align(Align::Right).color(text(theme::TEXT_DIM)));
+        let track = [ex + ew + 12.0 * s, bar[1], (rx - rw - 12.0 * s) - (ex + ew + 12.0 * s), bh];
+
+        let slider = |out: &mut Layer, t: [f32; 4], f: f32, knob: f32| {
+            let th = 4.0 * s;
+            let y = cy - th / 2.0;
+            out.quad(Quad::solid([t[0], y, t[2], th], rgb(0xffffff, 0.22 * ca), th / 2.0));
+            out.quad(Quad::solid([t[0], y, t[2] * f, th], rgb(0xffffff, 0.9 * ca), th / 2.0));
+            let k = knob * s;
+            out.quad(Quad::solid([t[0] + t[2] * f - k / 2.0, cy - k / 2.0, k, k], rgb(0xffffff, ca), k / 2.0));
+        };
+        let f = if duration > 0.0 { (pos / duration) as f32 } else { 0.0 };
+        slider(out, track, f, if v.scrub.is_some() { 14.0 } else { 11.0 });
+        let level = if self.muted { 0.0 } else { self.volume as f32 };
+        slider(out, vol, level, 9.0);
+        let glyph = match level {
+            0.0 => "\u{f0581}",
+            l if l < 0.34 => "\u{f057f}",
+            l if l < 0.67 => "\u{f0580}",
+            _ => "\u{f057e}",
+        };
+        icon(out, mute_cx, glyph, 17.0 * s);
+
+        o.hits.push((Hit::Toggle, toggle));
+        o.hits.push((Hit::Scrub, track));
+        o.hits.push((Hit::Mute, [mute_cx - 14.0 * s, cy - 14.0 * s, 28.0 * s, 28.0 * s]));
+        o.hits.push((Hit::Volume, vol));
+        o.hits.push((Hit::Bar, bar));
     }
 
     fn draw_chrome(&self, o: &mut Open, details: Option<&Details>, ca: f32, s: f32, out: &mut Layer) {
@@ -1195,6 +1574,16 @@ fn fit_rect(a: f32, (w, h): (f32, f32)) -> [f32; 4] {
     [(w - fw) / 2.0, (h - fh) / 2.0, fw, fh]
 }
 
+/// Texture coordinates of the visible part `clip` of an image drawn at `img`.
+fn uv_of(img: [f32; 4], clip: [f32; 4]) -> [f32; 4] {
+    [
+        (clip[0] - img[0]) / img[2],
+        (clip[1] - img[1]) / img[3],
+        (clip[0] + clip[2] - img[0]) / img[2],
+        (clip[1] + clip[3] - img[1]) / img[3],
+    ]
+}
+
 fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     let (x0, y0) = (a[0].max(b[0]), a[1].max(b[1]));
     let (x1, y1) = ((a[0] + a[2]).min(b[0] + b[2]), (a[1] + a[3]).min(b[1] + b[3]));
@@ -1237,16 +1626,45 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
-/// "0:01:05.123000" or 65123 (ms) → "1:05".
-fn format_duration(d: &serde_json::Value) -> String {
-    let secs = match d {
-        serde_json::Value::Number(ms) => ms.as_f64().unwrap_or(0.0) as u64 / 1000,
-        v => v.as_str().unwrap_or("").split(':').fold(0, |acc, p| {
-            acc * 60 + p.split('.').next().unwrap_or("0").parse::<u64>().unwrap_or(0)
-        }),
-    };
+/// Activity indicator: twelve spokes fading around the clock, a step every 1/12 s.
+fn spinner(out: &mut Layer, c: (f32, f32), rad: f32, alpha: f32, now: Instant) {
+    let bg = rad * 2.4;
+    out.quad(Quad::solid([c.0 - bg, c.1 - bg, bg * 2.0, bg * 2.0], rgb(0x000000, 0.4 * alpha), bg));
+    let step = (now.saturating_duration_since(epoch()).as_secs_f32() * 12.0) as usize % 12;
+    let d = rad * 0.4;
+    for k in 0..12 {
+        let a = k as f32 / 12.0 * std::f32::consts::TAU;
+        let (x, y) = (c.0 + a.sin() * rad, c.1 - a.cos() * rad);
+        let age = (step + 12 - k) % 12;
+        let o = 1.0 - age as f32 / 12.0 * 0.85;
+        out.quad(Quad::solid([x - d / 2.0, y - d / 2.0, d, d], rgb(0xffffff, o * alpha), d / 2.0));
+    }
+}
+
+/// A fixed instant that looping animations count from.
+fn epoch() -> Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+/// Seconds → "1:05" or "1:02:05".
+fn clock(t: f64) -> String {
+    let secs = t.max(0.0) as u64;
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+/// "0:01:05.123000" or 65123 (ms) → 65.123.
+fn duration_secs(d: &serde_json::Value) -> f64 {
+    match d {
+        serde_json::Value::Number(ms) => ms.as_f64().unwrap_or(0.0) / 1000.0,
+        v => v.as_str().unwrap_or("").split(':').fold(0.0, |acc, p| acc * 60.0 + p.parse::<f64>().unwrap_or(0.0)),
+    }
+}
+
+/// "0:01:05.123000" or 65123 (ms) → "1:05".
+fn format_duration(d: &serde_json::Value) -> String {
+    clock(duration_secs(d))
 }
 
 /// Wall-clock capture time; Immich's `localDateTime` is local time written with a "Z".
