@@ -2,6 +2,7 @@ mod grid;
 mod immich;
 mod library;
 mod loader;
+mod map;
 mod render;
 mod ui;
 mod ui_render;
@@ -57,6 +58,8 @@ struct Core {
     left: f32,
     /// UI drawn over the grid, rebuilt every frame.
     ui: ui::Frame,
+    /// The Places map, shown instead of the grid while open.
+    map: Option<map::MapView>,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -82,6 +85,14 @@ impl Core {
             velocity: 0.0,
             left: 0.0,
             ui: ui::Frame::default(),
+            map: None,
+        }
+    }
+
+    fn toggle_map(&mut self) {
+        match self.map.take() {
+            Some(m) => m.close(&mut self.renderer),
+            None => self.map = Some(map::MapView::new(&self.loader, self.scale)),
         }
     }
 
@@ -125,6 +136,17 @@ impl Core {
         self.frame += 1;
         let frame = self.frame;
         self.ui.clear();
+
+        // The map replaces the grid: no grid tiles drawn and no thumbnails requested.
+        if let Some(map) = &mut self.map {
+            self.instances.clear();
+            self.loader.set_wants(self.generation, []);
+            let area = [self.left, 0.0, self.size.0 as f32 - self.left, self.size.1 as f32];
+            let busy = map.update(now, &mut self.renderer, self.library.as_ref(), area, self.layout.vp.top, self.scale);
+            map.draw(&mut self.ui);
+            self.build_header();
+            return busy;
+        }
 
         // Mouse wheels glide to their target; touchpads coast after the fingers lift.
         if self.smooth_scroll.abs() > 0.5 {
@@ -232,6 +254,7 @@ impl Core {
     /// Title, counts and sync status over the grid's top scrim.
     fn build_header(&mut self) {
         let (title, subtitle) = match &self.library {
+            _ if self.map.is_some() => self.map.as_ref().unwrap().header(),
             None => ("Lumen".to_string(), String::new()),
             Some(lib) if lib.len() == 0 => ("Library".to_string(), "No photos yet".to_string()),
             Some(lib) => {
@@ -351,6 +374,16 @@ impl ApplicationHandler for App {
         let (Some(core), Some(gpu), Some(window)) = (&mut self.core, &mut self.gpu, &self.window) else { return };
         let now = Instant::now();
         let scale = window.scale_factor() as f32;
+        if let Some(map) = &mut core.map {
+            match map.event(&event, self.modifiers, now) {
+                map::Response::Ignored => {}
+                map::Response::Handled => return window.request_redraw(),
+                map::Response::Action(a) => {
+                    log::info!("map: {a:?}");
+                    return window.request_redraw();
+                }
+            }
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -429,6 +462,7 @@ impl ApplicationHandler for App {
                         window.set_fullscreen((!fs).then_some(Fullscreen::Borderless(None)));
                     }
                     Key::Character("q") if self.modifiers.control_key() => event_loop.exit(),
+                    Key::Character("m") => core.toggle_map(),
                     _ => {}
                 }
                 window.request_redraw();
@@ -494,7 +528,15 @@ async fn gpu_device(
 // ---------------------------------------------------------------------------------------------
 // Headless: render one frame to a PNG once everything visible has loaded.
 
-fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, zoom: i32, fit: bool) -> Result<()> {
+fn screenshot(
+    source: Source,
+    path: &str,
+    size: (u32, u32),
+    scale: f32,
+    zoom: i32,
+    fit: bool,
+    map_shot: Option<map::Shot>,
+) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let (_, device, queue) = pollster::block_on(gpu_device(&instance, None))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -511,14 +553,32 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, zoom: i3
             std::thread::sleep(Duration::from_millis(30));
             core.pump();
             let busy = core.update(Instant::now());
-            let done = core.library.is_some() && !busy && core.loader.is_idle() && core.status.is_empty();
+            let done = core.library.is_some()
+                && !busy
+                && core.loader.is_idle()
+                && core.status.is_empty()
+                && core.map.as_ref().is_none_or(|m| m.is_idle());
             quiet = if done { quiet + 1 } else { 0 };
         }
         Ok(())
     };
     settle(&mut core)?;
     let (cx, cy) = (size.0 as f32 / 2.0, size.1 as f32 / 2.0);
-    if fit {
+    if let Some(shot) = map_shot {
+        core.toggle_map();
+        let map = core.map.as_mut().unwrap();
+        if let Some((lat, lon, z)) = shot.at {
+            map.set_view(lat, lon, z);
+        }
+        settle(&mut core)?;
+        let map = core.map.as_mut().unwrap();
+        if let Some([x, y]) = shot.hover {
+            map.hover(x, y);
+        }
+        if let Some([x, y]) = shot.click {
+            println!("map click at {x},{y}: {:?}", map.click(x, y));
+        }
+    } else if fit {
         core.layout.zoom_to(core.layout.levels() - 1, cx, cy, Instant::now());
     } else if zoom != 0 {
         core.layout.zoom(zoom, cx, cy, Instant::now());
@@ -603,7 +663,8 @@ fn main() -> Result<()> {
             .unwrap_or((1600, 1000));
         let scale = flag("--scale").and_then(|s| s.parse().ok()).unwrap_or(1.0);
         let zoom = flag("--zoom").and_then(|s| s.parse().ok()).unwrap_or(0);
-        return screenshot(source, &path, size, scale, zoom, args.iter().any(|a| a == "--fit"));
+        let fit = args.iter().any(|a| a == "--fit");
+        return screenshot(source, &path, size, scale, zoom, fit, map::Shot::parse(&args));
     }
 
     let event_loop = EventLoop::<()>::with_user_event().build().context("event loop")?;
