@@ -181,6 +181,13 @@ impl Loader {
         loader
     }
 
+    /// Re-syncs `collection` from the server even if it was fetched recently (the server told
+    /// us something changed). Any collection may be affected, so every memo goes.
+    pub fn refresh(&self, collection: Collection) {
+        self.shared.fresh.lock().unwrap().clear();
+        self.open(collection);
+    }
+
     /// Switches the grid to `collection`: cached version first, then a refresh. Supersedes
     /// any sync still running for an earlier `open`.
     pub fn open(&self, collection: Collection) {

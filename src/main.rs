@@ -2,6 +2,7 @@ mod gestures;
 mod grid;
 mod immich;
 mod library;
+mod live;
 mod loader;
 mod map;
 mod render;
@@ -71,6 +72,8 @@ struct Core {
     viewer: viewer::Viewer,
     /// The Places map, shown instead of the grid while open.
     map: Option<map::MapView>,
+    /// Server push notifications ("assets changed"), when connected to Immich.
+    live: Option<Receiver<()>>,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -81,6 +84,10 @@ impl Core {
     fn new(loader: Loader, renderer: Renderer, size: (u32, u32), scale: f32) -> Self {
         let sidebar = sidebar::Sidebar::new(&loader);
         let viewer = viewer::Viewer::new(&loader);
+        let live = match loader.source() {
+            Source::Immich(immich) => Some(live::start(immich.clone(), &loader.handle(), loader.waker())),
+            Source::Demo(_) => None,
+        };
         Self {
             loader,
             renderer,
@@ -102,6 +109,7 @@ impl Core {
             collection: Arc::new(Collection::library()),
             viewer,
             map: None,
+            live,
         }
     }
 
@@ -133,6 +141,10 @@ impl Core {
     }
 
     fn pump(&mut self) {
+        // The server says assets changed: re-sync what's on screen (scroll position is kept).
+        if self.live.as_ref().is_some_and(|rx| rx.try_iter().count() > 0) {
+            self.loader.refresh((*self.collection).clone());
+        }
         while let Ok(msg) = self.loader.rx.try_recv() {
             match msg {
                 Msg::Library { library, generation, collection } => {
