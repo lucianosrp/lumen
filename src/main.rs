@@ -7,6 +7,7 @@ mod render;
 mod sidebar;
 mod ui;
 mod ui_render;
+mod viewer;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -65,6 +66,7 @@ struct Core {
     sidebar: sidebar::Sidebar,
     /// What the grid is showing (the library, an album…).
     collection: Arc<Collection>,
+    viewer: viewer::Viewer,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -74,6 +76,7 @@ fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
 impl Core {
     fn new(loader: Loader, renderer: Renderer, size: (u32, u32), scale: f32) -> Self {
         let sidebar = sidebar::Sidebar::new(&loader);
+        let viewer = viewer::Viewer::new(&loader);
         Self {
             loader,
             renderer,
@@ -93,6 +96,7 @@ impl Core {
             ui: ui::Frame::default(),
             sidebar,
             collection: Arc::new(Collection::library()),
+            viewer,
         }
     }
 
@@ -255,8 +259,11 @@ impl Core {
             self.pending.pop_front();
         }
 
+        let (lib, overlay) = (self.library.as_ref(), &mut self.ui.overlay);
+        let viewing = self.viewer.update(now, lib, &mut self.layout, self.left, self.scale, self.size, &mut self.renderer, overlay);
+
         self.build_header();
-        sidebar_moving || fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
+        sidebar_moving || viewing || fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
     }
 
     /// Handles a sidebar click (or `--select`).
@@ -362,6 +369,8 @@ struct App {
     pinch: Option<Receiver<gestures::Pinch>>,
     /// ln(scale) already turned into zoom steps during the current pinch.
     pinch_applied: f64,
+    /// Where the left button went down, to tell clicks from drags.
+    press: Option<(f32, f32)>,
 }
 
 /// Finger-distance change (as a ratio) per grid zoom level.
@@ -446,6 +455,11 @@ impl ApplicationHandler for App {
         let (Some(core), Some(gpu), Some(window)) = (&mut self.core, &mut self.gpu, &self.window) else { return };
         let now = Instant::now();
         let scale = window.scale_factor() as f32;
+        // The viewer captures input while it's open.
+        if core.viewer.is_open() && core.viewer.input(&event, self.modifiers, now) {
+            window.request_redraw();
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -478,6 +492,17 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } if core.sidebar.wheel(delta, scale) => window.request_redraw(),
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
+                ElementState::Pressed => self.press = Some(self.cursor),
+                ElementState::Released => {
+                    let (x, y) = self.cursor;
+                    let still = self.press.take().is_some_and(|p| (p.0 - x).abs() + (p.1 - y).abs() < 6.0);
+                    if still && core.viewer.click_grid(core.library.as_ref(), &core.layout, core.left, x, y, now) {
+                        (core.velocity, core.smooth_scroll) = (0.0, 0.0);
+                        window.request_redraw();
+                    }
+                }
+            },
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 let zooming = self.modifiers.control_key() || self.modifiers.super_key();
                 match (delta, zooming) {
@@ -611,6 +636,7 @@ struct Shot {
     /// Sidebar row to click first, see `Sidebar::select`.
     select: Option<String>,
     sidebar: bool,
+    viewer: Option<viewer::Shot>,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -635,7 +661,8 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
                 && !busy
                 && core.loader.is_idle()
                 && core.sidebar.is_idle()
-                && core.status.is_empty();
+                && core.status.is_empty()
+                && !core.viewer.loading();
             quiet = if done { quiet + 1 } else { 0 };
         }
         Ok(())
@@ -654,6 +681,33 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
         core.layout.zoom(shot.zoom, cx, cy, Instant::now());
     }
     settle(&mut core)?;
+    if let Some(shot) = shot.viewer {
+        let lib = core.library.clone().context("no library")?;
+        let i = shot.index(lib.len());
+        viewer::reveal(&mut core.layout, i);
+        settle(&mut core)?;
+        core.viewer.hold_chrome = true;
+        core.viewer.open(lib, i, Instant::now());
+        if shot.info {
+            core.viewer.toggle_info();
+        }
+        settle(&mut core)?;
+        for _ in 0..shot.next.unsigned_abs() {
+            core.viewer.go(shot.next.signum(), Instant::now());
+            settle(&mut core)?;
+        }
+        if let Some(z) = shot.zoom {
+            core.viewer.zoom(z);
+            settle(&mut core)?;
+        }
+        if let Some(ms) = shot.open_at {
+            core.viewer.rewind(ms);
+        }
+        if let Some(ms) = shot.close_at {
+            core.viewer.close_since(ms);
+        }
+        core.update(Instant::now());
+    }
 
     let device = &core.renderer.device;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -737,6 +791,14 @@ fn main() -> Result<()> {
             fit: args.iter().any(|a| a == "--fit"),
             select: flag("--select"),
             sidebar: !args.iter().any(|a| a == "--no-sidebar"),
+            viewer: flag("--open").map(|at| viewer::Shot {
+                at,
+                open_at: flag("--open-at").and_then(|s| s.parse().ok()),
+                info: args.iter().any(|a| a == "--info"),
+                next: flag("--next").and_then(|s| s.parse().ok()).unwrap_or(0),
+                zoom: flag("--viewer-zoom").and_then(|s| s.parse().ok()),
+                close_at: flag("--close-at").and_then(|s| s.parse().ok()),
+            }),
         };
         return screenshot(source, &path, size, scale, shot);
     }
@@ -754,6 +816,7 @@ fn main() -> Result<()> {
         last_pixel_scroll: None,
         pinch: None,
         pinch_applied: 0.0,
+        press: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

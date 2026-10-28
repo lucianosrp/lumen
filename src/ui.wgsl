@@ -39,6 +39,7 @@ fn vs_ui(@builtin(vertex_index) vi: u32, q: Quad) -> VOut {
 @fragment
 fn fs_ui(v: VOut) -> @location(0) vec4f {
     let r = min(v.params.x, min(v.half.x, v.half.y));
+    // Exact box SDF: negative inside, so square corners (r = 0) are fully covered too.
     let q = abs(v.local) - v.half + r;
     let d = length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r;
     let coverage = clamp(0.5 - d, 0.0, 1.0);
