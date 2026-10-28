@@ -5,6 +5,7 @@ mod loader;
 mod render;
 mod ui;
 mod ui_render;
+mod viewer;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Theme, Window, WindowId};
@@ -57,6 +58,7 @@ struct Core {
     left: f32,
     /// UI drawn over the grid, rebuilt every frame.
     ui: ui::Frame,
+    viewer: viewer::Viewer,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -65,6 +67,7 @@ fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
 
 impl Core {
     fn new(loader: Loader, renderer: Renderer, size: (u32, u32), scale: f32) -> Self {
+        let viewer = viewer::Viewer::new(&loader);
         Self {
             loader,
             renderer,
@@ -82,6 +85,7 @@ impl Core {
             velocity: 0.0,
             left: 0.0,
             ui: ui::Frame::default(),
+            viewer,
         }
     }
 
@@ -225,8 +229,11 @@ impl Core {
             self.pending.pop_front();
         }
 
+        let (lib, overlay) = (self.library.as_ref(), &mut self.ui.overlay);
+        let viewing = self.viewer.update(now, lib, &mut self.layout, self.left, self.scale, self.size, &mut self.renderer, overlay);
+
         self.build_header();
-        fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
+        viewing || fading || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
     }
 
     /// Title, counts and sync status over the grid's top scrim.
@@ -306,6 +313,8 @@ struct App {
     cursor: (f32, f32),
     zoom_accum: f32,
     last_pixel_scroll: Option<(Instant, f32)>,
+    /// Where the left button went down, to tell clicks from drags.
+    press: Option<(f32, f32)>,
 }
 
 impl ApplicationHandler for App {
@@ -351,6 +360,11 @@ impl ApplicationHandler for App {
         let (Some(core), Some(gpu), Some(window)) = (&mut self.core, &mut self.gpu, &self.window) else { return };
         let now = Instant::now();
         let scale = window.scale_factor() as f32;
+        // The viewer captures input while it's open.
+        if core.viewer.is_open() && core.viewer.input(&event, self.modifiers, now) {
+            window.request_redraw();
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -368,6 +382,17 @@ impl ApplicationHandler for App {
                 self.cursor = (position.x as f32, position.y as f32);
                 window.request_redraw();
             }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
+                ElementState::Pressed => self.press = Some(self.cursor),
+                ElementState::Released => {
+                    let (x, y) = self.cursor;
+                    let still = self.press.take().is_some_and(|p| (p.0 - x).abs() + (p.1 - y).abs() < 6.0);
+                    if still && core.viewer.click_grid(core.library.as_ref(), &core.layout, core.left, x, y, now) {
+                        (core.velocity, core.smooth_scroll) = (0.0, 0.0);
+                        window.request_redraw();
+                    }
+                }
+            },
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 let zooming = self.modifiers.control_key() || self.modifiers.super_key();
                 match (delta, zooming) {
@@ -494,7 +519,15 @@ async fn gpu_device(
 // ---------------------------------------------------------------------------------------------
 // Headless: render one frame to a PNG once everything visible has loaded.
 
-fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, zoom: i32, fit: bool) -> Result<()> {
+fn screenshot(
+    source: Source,
+    path: &str,
+    size: (u32, u32),
+    scale: f32,
+    zoom: i32,
+    fit: bool,
+    shot: Option<viewer::Shot>,
+) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let (_, device, queue) = pollster::block_on(gpu_device(&instance, None))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -511,7 +544,7 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, zoom: i3
             std::thread::sleep(Duration::from_millis(30));
             core.pump();
             let busy = core.update(Instant::now());
-            let done = core.library.is_some() && !busy && core.loader.is_idle() && core.status.is_empty();
+            let done = core.library.is_some() && !busy && core.loader.is_idle() && core.status.is_empty() && !core.viewer.loading();
             quiet = if done { quiet + 1 } else { 0 };
         }
         Ok(())
@@ -524,6 +557,33 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, zoom: i3
         core.layout.zoom(zoom, cx, cy, Instant::now());
     }
     settle(&mut core)?;
+    if let Some(shot) = shot {
+        let lib = core.library.clone().context("no library")?;
+        let i = shot.index(lib.len());
+        viewer::reveal(&mut core.layout, i);
+        settle(&mut core)?;
+        core.viewer.hold_chrome = true;
+        core.viewer.open(lib, i, Instant::now());
+        if shot.info {
+            core.viewer.toggle_info();
+        }
+        settle(&mut core)?;
+        for _ in 0..shot.next.unsigned_abs() {
+            core.viewer.go(shot.next.signum(), Instant::now());
+            settle(&mut core)?;
+        }
+        if let Some(z) = shot.zoom {
+            core.viewer.zoom(z);
+            settle(&mut core)?;
+        }
+        if let Some(ms) = shot.open_at {
+            core.viewer.rewind(ms);
+        }
+        if let Some(ms) = shot.close_at {
+            core.viewer.close_since(ms);
+        }
+        core.update(Instant::now());
+    }
 
     let device = &core.renderer.device;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -603,7 +663,15 @@ fn main() -> Result<()> {
             .unwrap_or((1600, 1000));
         let scale = flag("--scale").and_then(|s| s.parse().ok()).unwrap_or(1.0);
         let zoom = flag("--zoom").and_then(|s| s.parse().ok()).unwrap_or(0);
-        return screenshot(source, &path, size, scale, zoom, args.iter().any(|a| a == "--fit"));
+        let shot = flag("--open").map(|at| viewer::Shot {
+            at,
+            open_at: flag("--open-at").and_then(|s| s.parse().ok()),
+            info: args.iter().any(|a| a == "--info"),
+            next: flag("--next").and_then(|s| s.parse().ok()).unwrap_or(0),
+            zoom: flag("--viewer-zoom").and_then(|s| s.parse().ok()),
+            close_at: flag("--close-at").and_then(|s| s.parse().ok()),
+        });
+        return screenshot(source, &path, size, scale, zoom, args.iter().any(|a| a == "--fit"), shot);
     }
 
     let event_loop = EventLoop::<()>::with_user_event().build().context("event loop")?;
@@ -617,6 +685,7 @@ fn main() -> Result<()> {
         cursor: (0.0, 0.0),
         zoom_accum: 0.0,
         last_pixel_scroll: None,
+        press: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
