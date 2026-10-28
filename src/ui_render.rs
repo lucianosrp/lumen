@@ -22,7 +22,7 @@ struct QuadInstance {
 }
 
 struct Image {
-    _tex: wgpu::Texture,
+    tex: wgpu::Texture,
     bind: wgpu::BindGroup,
     size: (u32, u32),
 }
@@ -154,7 +154,7 @@ impl UiRenderer {
         ];
 
         // Solid quads still need something bound at group 1.
-        let white = make_image(device, queue, &image_layout, 1, 1, &[255, 255, 255, 255]).bind;
+        let white = make_image(device, queue, &image_layout, 1, 1, &[255, 255, 255, 255], false).bind;
         Self {
             pipeline,
             globals_bind,
@@ -184,11 +184,32 @@ impl UiRenderer {
 
     /// Uploads an RGBA8 sRGB image and returns a handle for `Quad::image`.
     pub fn create_image(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) -> ImageId {
-        let image = make_image(device, queue, &self.image_layout, w, h, rgba);
+        let image = make_image(device, queue, &self.image_layout, w, h, rgba, true);
         let id = self.next_image;
         self.next_image += 1;
         self.images.insert(id, image);
         id
+    }
+
+    /// Like `create_image` but without mips, for content rewritten every frame (video).
+    pub fn create_frame_image(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) -> ImageId {
+        let image = make_image(device, queue, &self.image_layout, w, h, rgba, false);
+        let id = self.next_image;
+        self.next_image += 1;
+        self.images.insert(id, image);
+        id
+    }
+
+    /// Overwrites mip 0 of an image in place; `rgba` must match its size.
+    pub fn update_image(&self, queue: &wgpu::Queue, id: ImageId, rgba: &[u8]) {
+        let Some(img) = self.images.get(&id) else { return };
+        let (w, h) = img.size;
+        queue.write_texture(
+            img.tex.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
     }
 
     pub fn free_image(&mut self, id: ImageId) {
@@ -340,9 +361,17 @@ fn text_key(t: &crate::ui::Text) -> TextKey {
     }
 }
 
-/// Uploads an RGBA8 sRGB image with a full mip chain.
-fn make_image(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout, w: u32, h: u32, rgba: &[u8]) -> Image {
-        let mips = 32 - w.max(h).max(1).leading_zeros();
+/// Uploads an RGBA8 sRGB image, with a full mip chain if `mips`.
+fn make_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+    mips: bool,
+) -> Image {
+        let mips = if mips { 32 - w.max(h).max(1).leading_zeros() } else { 1 };
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ui image"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -377,5 +406,5 @@ fn make_image(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGro
             layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
         });
-        Image { _tex: tex, bind, size: (w, h) }
+        Image { tex, bind, size: (w, h) }
 }

@@ -8,6 +8,7 @@ mod render;
 mod sidebar;
 mod ui;
 mod ui_render;
+mod video;
 mod viewer;
 
 use std::collections::VecDeque;
@@ -725,6 +726,8 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
     let renderer = Renderer::new(device, queue, format);
     let mut core = Core::new(Loader::start(source, || {}), renderer, size, scale);
     core.sidebar.set_shown(shot.sidebar);
+    // Videos only play when asked (--play-at), and never out loud.
+    (core.viewer.autoplay, core.viewer.silent) = (false, true);
 
     let settle = |core: &mut Core| -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -783,7 +786,7 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
     settle(&mut core)?;
     if let Some(shot) = shot.viewer {
         let lib = core.library.clone().context("no library")?;
-        let i = shot.index(lib.len());
+        let i = shot.index(&lib);
         viewer::reveal(&mut core.layout, i);
         settle(&mut core)?;
         core.viewer.hold_chrome = true;
@@ -799,6 +802,23 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
         if let Some(z) = shot.zoom {
             core.viewer.zoom(z);
             settle(&mut core)?;
+        }
+        if let Some(t) = shot.play_at {
+            core.viewer.play_at(t);
+            let start = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+                core.pump();
+                core.update(Instant::now());
+                let waited = start.elapsed();
+                if shot.play_wait.map_or(core.viewer.video_ready(t), |ms| waited >= Duration::from_millis(ms)) {
+                    break;
+                }
+                if waited > Duration::from_secs(60) {
+                    bail!("timed out waiting for a video frame ({})", core.viewer.video_status());
+                }
+            }
+            println!("{} after {:.0} ms", core.viewer.video_status(), start.elapsed().as_secs_f64() * 1000.0);
         }
         if let Some(ms) = shot.open_at {
             core.viewer.rewind(ms);
@@ -914,6 +934,8 @@ fn main() -> Result<()> {
                 next: flag("--next").and_then(|s| s.parse().ok()).unwrap_or(0),
                 zoom: flag("--viewer-zoom").and_then(|s| s.parse().ok()),
                 close_at: flag("--close-at").and_then(|s| s.parse().ok()),
+                play_at: flag("--play-at").and_then(|s| s.parse().ok()),
+                play_wait: flag("--play-wait").and_then(|s| s.parse().ok()),
             }),
             map: map::Shot::parse(&args),
             pinch: flag("--pinch").and_then(|s| {
