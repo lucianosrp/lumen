@@ -27,11 +27,15 @@ const THUMB: f32 = 22.0;
 const THUMB_PX: u32 = 64;
 const SLIDE_TIME: f32 = 0.22;
 const WHEEL_STEP: f32 = 60.0;
+/// Height of the pinned Settings row at the bottom (feat/settings).
+const FOOTER: f32 = 48.0;
 
 /// What a click asks the app to do.
 pub enum Action {
     Open(Collection),
     Places,
+    /// The gear row pinned at the bottom (feat/settings).
+    Settings,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +196,15 @@ impl Sidebar {
         if x < 10.0 * scale || x > (WIDTH - 10.0) * scale {
             return None;
         }
+        // Settings: the pinned footer row (feat/settings).
+        if y >= height - FOOTER * scale {
+            let mid = height / scale - FOOTER / 2.0;
+            if (y / scale - mid).abs() <= ROW / 2.0 {
+                self.selected = "settings".into();
+                return Some(Action::Settings);
+            }
+            return None;
+        }
         let cy = y / scale + self.scroll;
         let i = self.items.iter().position(|(top, it)| matches!(it, Item::Row(_)) && cy >= *top && cy < top + ROW)?;
         self.activate(i, height / scale)
@@ -205,6 +218,10 @@ impl Sidebar {
     }
 
     pub fn select(&mut self, spec: &str, height: f32, scale: f32) -> Result<Option<Action>> {
+        if spec == "settings" {
+            self.selected = "settings".into();
+            return Ok(Some(Action::Settings));
+        }
         let (kind, name) = spec.split_once(':').unwrap_or((spec, ""));
         let name = name.to_lowercase();
         let found = self.items.iter().position(|(_, it)| match it {
@@ -329,7 +346,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     let goal = if sb.shown { 1.0 } else { 0.0 };
     let sliding = sb.anim != goal;
     sb.anim = if sb.anim < goal { (sb.anim + dt / SLIDE_TIME).min(goal) } else { (sb.anim - dt / SLIDE_TIME).max(goal) };
-    let view = h / s;
+    let view = h / s - FOOTER;
     let max = (sb.content - view).max(0.0);
     sb.scroll_to = sb.scroll_to.clamp(0.0, max);
     let gliding = (sb.scroll_to - sb.scroll).abs() > 0.3;
@@ -348,7 +365,7 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
     base.quad(Quad::solid([x0, 0.0, width, h], rgb(theme::SIDEBAR, 0.99), 0.0));
     let line = s.round().max(1.0);
     base.quad(Quad::solid([x0 + width - line, 0.0, line, h], rgb(theme::SEPARATOR, 1.0), 0.0));
-    let clip = [x0, 0.0, width - line, h];
+    let clip = [x0, 0.0, width - line, h - FOOTER * s];
     let hover = sb.contains(sb.cursor, s).then_some(sb.cursor);
 
     for (top, item) in &sb.items {
@@ -411,6 +428,31 @@ fn draw(sb: &mut Sidebar, uir: &mut crate::ui_render::UiRenderer, base: &mut cra
         let color = if selected { [255, 255, 255, 255] } else { theme::TEXT };
         base.text(Text::new(label, x0 + 52.0 * s, mid - text_size * 0.625, text_size).weight(500).color(color).clip(clip));
     }
+    draw_footer(sb, base, s, x0, h);
+}
+
+/// Settings row pinned under the scrolling list, over an opaque strip (feat/settings).
+fn draw_footer(sb: &Sidebar, base: &mut crate::ui::Layer, s: f32, x0: f32, h: f32) {
+    let (width, line) = (WIDTH * s, s.round().max(1.0));
+    let top = h - FOOTER * s;
+    base.quad(Quad::solid([x0, top, width - line, FOOTER * s], rgb(theme::SIDEBAR, 1.0), 0.0));
+    if sb.content - sb.scroll > h / s - FOOTER {
+        base.quad(Quad::solid([x0, top, width - line, line], rgb(theme::SEPARATOR, 1.0), 0.0));
+    }
+    let pill = [x0 + 10.0 * s, top + (FOOTER - ROW) / 2.0 * s, width - 20.0 * s, ROW * s];
+    let selected = sb.selected == "settings";
+    let hovered = sb.contains(sb.cursor, s) && crate::ui::contains(pill, sb.cursor.0, sb.cursor.1);
+    if selected {
+        base.quad(Quad::solid(pill, rgb(theme::ACCENT, 1.0), 7.0 * s));
+    } else if hovered {
+        base.quad(Quad::solid(pill, rgb(0x2a2a2e, 1.0), 7.0 * s));
+    }
+    let mid = pill[1] + ROW * s / 2.0;
+    let (icon, text) = (15.0 * s, 13.0 * s);
+    let color = if selected { theme::TEXT } else { [64, 156, 255, 255] };
+    base.text(Text::new("\u{f013}", x0 + 31.0 * s, mid - icon * 0.625, icon).icon().color(color).align(Align::Center));
+    let color = if selected { [255, 255, 255, 255] } else { theme::TEXT };
+    base.text(Text::new("Settings", x0 + 52.0 * s, mid - text * 0.625, text).weight(500).color(color));
 }
 
 /// Shortens `text` with a trailing ellipsis until it fits in `max` pixels.

@@ -129,11 +129,15 @@ pub struct Layout {
     pub level: usize,
     /// Active touchpad pinch: anchor (grid-local px) and scale relative to `target`.
     pinch: Option<([f32; 2], f32)>,
+    /// Column count a newly opened collection starts at (Settings → Thumbnail size).
+    pub default_cols: u32,
+    /// How long a mid-pinch reflow takes (Settings → Pinch zoom speed).
+    pub reflow_time: Duration,
 }
 
 const ZOOM_TIME: Duration = Duration::from_millis(340);
 /// Reflows during a pinch are quicker: the fingers are already driving the motion.
-const PINCH_REFLOW_TIME: Duration = Duration::from_millis(180);
+pub const PINCH_REFLOW_TIME: Duration = Duration::from_millis(180);
 const LEVELS: [u32; 18] = [1, 3, 5, 7, 9, 13, 19, 27, 39, 55, 79, 113, 161, 229, 325, 461, 655, 931];
 
 fn ease(t: f32) -> f32 {
@@ -143,7 +147,7 @@ fn ease(t: f32) -> f32 {
 
 impl Layout {
     pub fn new(vp: Viewport) -> Self {
-        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0 }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None }
+        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0 }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None, default_cols: 9, reflow_time: PINCH_REFLOW_TIME }
     }
 
     /// Columns at which the whole library fits on one screen.
@@ -186,7 +190,7 @@ impl Layout {
         self.n = n;
         self.rebuild_levels();
         if self.n == 0 || !keep_from_bottom {
-            self.level = self.nearest_level(9);
+            self.level = self.nearest_level(self.default_cols);
             self.target.cols = self.levels[self.level];
             self.target.scroll = f32::MAX;
         } else {
@@ -305,7 +309,7 @@ impl Layout {
         let current = self.current(now);
         self.set_level(level, ax, ay);
         self.pinch = Some(([ax, ay], s));
-        self.freeze(current, now, PINCH_REFLOW_TIME);
+        self.freeze(current, now, self.reflow_time);
         self.from_scale = Some(s);
     }
 

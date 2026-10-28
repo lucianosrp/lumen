@@ -5,11 +5,15 @@ mod library;
 mod loader;
 mod map;
 mod render;
+mod settings;
+mod settings_ui;
 mod sidebar;
+mod storage;
 mod ui;
 mod ui_render;
 mod video;
 mod viewer;
+mod widgets;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -29,16 +33,11 @@ use loader::{Collection, Loader, Msg, Source, Thumb, Tier, group};
 use render::{Instance, LARGE_BIT, NO_SLOT, Renderer, XL_BIT};
 use ui::{Text, theme};
 
-/// Tiles below this many physical pixels show only their thumbhash.
-const SMALL_MIN: f32 = 18.0;
-/// Tiles at or above this size get the 256px thumbnail instead of the 64px one.
-const LARGE_MIN: f32 = 88.0;
-/// Tiles at or above this size get the server's ~1440px preview.
-const XL_MIN: f32 = 400.0;
+// Tile-size thresholds for each thumbnail tier: see `settings::Quality::tiers`.
 const FADE: f32 = 0.22;
-/// Touchpad pixels → screen pixels.
+/// Touchpad pixels → screen pixels (times Settings → Scroll speed).
 const TOUCHPAD_SPEED: f32 = 2.5;
-/// Logical pixels per mouse-wheel notch.
+/// Logical pixels per mouse-wheel notch (times Settings → Scroll speed).
 const WHEEL_STEP: f32 = 300.0;
 const MONTHS: [&str; 12] = [
     "January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
@@ -71,6 +70,9 @@ struct Core {
     viewer: viewer::Viewer,
     /// The Places map, shown instead of the grid while open.
     map: Option<map::MapView>,
+    // feat/settings: preferences, and the Settings page shown instead of the grid while open.
+    settings: settings::Settings,
+    settings_page: Option<settings_ui::Page>,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32) -> Viewport {
@@ -81,7 +83,9 @@ impl Core {
     fn new(loader: Loader, renderer: Renderer, size: (u32, u32), scale: f32) -> Self {
         let sidebar = sidebar::Sidebar::new(&loader);
         let viewer = viewer::Viewer::new(&loader);
-        Self {
+        // The renderer was built for a memory budget already; don't rebuild its atlases.
+        let settings = settings::Settings { gpu_memory: renderer.gpu_memory, ..settings::Settings::load() };
+        let mut core = Self {
             loader,
             renderer,
             library: None,
@@ -102,7 +106,11 @@ impl Core {
             collection: Arc::new(Collection::library()),
             viewer,
             map: None,
-        }
+            settings,
+            settings_page: None,
+        };
+        settings::apply(&mut core);
+        core
     }
 
     fn toggle_map(&mut self) {
@@ -161,6 +169,11 @@ impl Core {
         self.ui.clear();
         let sidebar_moving = sidebar::update(self, now);
 
+        // The Settings page replaces the grid, like the map below (feat/settings).
+        if self.settings_page.is_some() {
+            return settings_ui::update(self, now) || sidebar_moving;
+        }
+
         // The map replaces the grid: no grid tiles drawn and no thumbnails requested.
         if let Some(map) = &mut self.map {
             self.instances.clear();
@@ -203,11 +216,12 @@ impl Core {
         let target = grid::Spec::Grid(self.layout.target);
         let settled = !self.layout.animating(now) && self.velocity == 0.0 && self.smooth_scroll == 0.0;
         let margin = if settled { vp.height } else { 0.0 };
+        let tiers = self.settings.tiers();
         let mut wants: Vec<(f32, (usize, Tier))> = Vec::new();
         for r in self.layout.visible(&target, margin) {
             for i in r {
                 let rect = target.rect(i, &vp);
-                let Some(mut tier) = tier_for(rect[2]) else { continue };
+                let Some(mut tier) = tier_for(rect[2], tiers) else { continue };
                 // Mid-pinch sizes are transient; fetch big previews once the fingers lift.
                 if tier == Tier::Xl && self.layout.pinching() {
                     tier = Tier::Large;
@@ -260,8 +274,8 @@ impl Core {
                 let size = rect[2];
                 let (mut slot, mut loaded) = (NO_SLOT, None);
                 let r = &mut self.renderer;
-                let xl = (size >= XL_MIN * 0.75).then(|| r.xl.get(i)).flatten();
-                let large = (size >= LARGE_MIN * 0.75).then(|| r.large.get(i)).flatten();
+                let xl = (size >= tiers.xl * 0.75).then(|| r.xl.get(i)).flatten();
+                let large = (size >= tiers.large * 0.75).then(|| r.large.get(i)).flatten();
                 let small = r.small.get(i);
                 if let Some(s) = xl {
                     r.xl.touch(s, frame);
@@ -278,7 +292,7 @@ impl Core {
                 let fade = if upgrade { 1.0 } else { loaded.map_or(0.0, |t| (now.duration_since(t).as_secs_f32() / FADE).min(1.0)) };
                 fading |= fade < 1.0 && slot != NO_SLOT;
                 // Hairline gaps when tiles are big enough to read as photos; a seamless mosaic below.
-                let gap = if size < 40.0 * self.scale { 0.0 } else { (size * 0.012).clamp(1.0, 2.0 * self.scale) };
+                let gap = if size < 40.0 * self.scale || !self.settings.gaps { 0.0 } else { (size * 0.012).clamp(1.0, 2.0 * self.scale) };
                 rect = [self.left + rect[0] + gap / 2.0, rect[1] + gap / 2.0, rect[2] - gap, rect[3] - gap];
                 self.instances.push(Instance { rect, th: i as u32, slot, fade: ease_out(fade), _pad: 0.0 });
             }
@@ -308,10 +322,15 @@ impl Core {
     fn apply(&mut self, action: sidebar::Action) {
         match action {
             sidebar::Action::Open(c) => {
+                settings_ui::leave(self);
                 self.set_map(false);
                 self.loader.open(c);
             }
-            sidebar::Action::Places => self.set_map(true),
+            sidebar::Action::Places => {
+                settings_ui::leave(self);
+                self.set_map(true);
+            }
+            sidebar::Action::Settings => settings_ui::open(self),
         }
     }
 
@@ -381,12 +400,12 @@ impl Core {
     }
 }
 
-fn tier_for(size: f32) -> Option<Tier> {
-    if size >= XL_MIN {
+fn tier_for(size: f32, tiers: settings::Tiers) -> Option<Tier> {
+    if size >= tiers.xl {
         Some(Tier::Xl)
-    } else if size >= LARGE_MIN {
+    } else if size >= tiers.large {
         Some(Tier::Large)
-    } else if size >= SMALL_MIN {
+    } else if size >= tiers.small {
         Some(Tier::Small)
     } else {
         None
@@ -451,7 +470,7 @@ impl ApplicationHandler for App {
         let loader = Loader::start(self.source.clone(), move || {
             let _ = proxy.send_event(());
         });
-        let renderer = Renderer::new(device, queue, config.format);
+        let renderer = Renderer::new(device, queue, config.format, adapter.get_info(), settings::Settings::load().gpu_memory);
 
         use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
         if let Ok(RawDisplayHandle::Wayland(h)) = window.display_handle().map(|h| h.as_raw()) {
@@ -520,6 +539,17 @@ impl ApplicationHandler for App {
         }
         // The map owns its area while open; the sidebar keeps its own clicks and scrolling.
         let over_sidebar = core.sidebar.contains(self.cursor, scale);
+        // The Settings page owns its area while open (feat/settings).
+        if let Some(page) = &mut core.settings_page {
+            match page.event(&event, self.cursor, over_sidebar, self.modifiers, scale) {
+                settings_ui::Response::Ignored => {}
+                settings_ui::Response::Handled => return window.request_redraw(),
+                settings_ui::Response::Close => {
+                    settings_ui::close(core);
+                    return window.request_redraw();
+                }
+            }
+        }
         if let (Some(map), false) = (&mut core.map, over_sidebar) {
             match map.event(&event, self.modifiers, now) {
                 map::Response::Ignored => {}
@@ -580,10 +610,10 @@ impl ApplicationHandler for App {
                     (MouseScrollDelta::PixelDelta(p), true) => self.zoom_accum -= p.y as f32 / 40.0,
                     (MouseScrollDelta::LineDelta(_, y), false) => {
                         core.velocity = 0.0;
-                        core.smooth_scroll -= y * WHEEL_STEP * scale;
+                        core.smooth_scroll -= y * WHEEL_STEP * core.settings.scroll_speed * scale;
                     }
                     (MouseScrollDelta::PixelDelta(p), false) => {
-                        let dy = -p.y as f32 * TOUCHPAD_SPEED;
+                        let dy = -p.y as f32 * TOUCHPAD_SPEED * core.settings.scroll_speed;
                         core.smooth_scroll = 0.0;
                         core.velocity = 0.0;
                         core.layout.scroll_by(dy);
@@ -600,7 +630,7 @@ impl ApplicationHandler for App {
                 }
                 if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) && !zooming {
                     if let Some((t, v)) = self.last_pixel_scroll.take() {
-                        if now.duration_since(t) < Duration::from_millis(80) {
+                        if now.duration_since(t) < Duration::from_millis(80) && core.settings.momentum {
                             core.velocity = v.clamp(-40_000.0, 40_000.0);
                         }
                     }
@@ -635,6 +665,7 @@ impl ApplicationHandler for App {
                     }
                     Key::Character("q") if self.modifiers.control_key() => event_loop.exit(),
                     Key::Character("b") if self.modifiers.control_key() => core.sidebar.toggle(),
+                    Key::Character(",") if self.modifiers.control_key() => settings_ui::toggle(core),
                     Key::Character("m") => {
                         core.toggle_map();
                         core.sidebar.set_selected(if core.map.is_some() { "places" } else { "library" });
@@ -717,14 +748,19 @@ struct Shot {
     map: Option<map::Shot>,
     /// Simulated touchpad pinch: final scale, and whether the fingers lift.
     pinch: Option<(f32, bool)>,
+    // feat/settings: `--set key=value` overrides, and `--settings` page options.
+    settings: settings::Settings,
+    page: Option<settings_ui::Shot>,
 }
 
 fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let (_, device, queue) = pollster::block_on(gpu_device(&instance, None))?;
+    let (adapter, device, queue) = pollster::block_on(gpu_device(&instance, None))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let renderer = Renderer::new(device, queue, format);
+    let renderer = Renderer::new(device, queue, format, adapter.get_info(), shot.settings.gpu_memory);
     let mut core = Core::new(Loader::start(source, || {}), renderer, size, scale);
+    core.settings = shot.settings.clone();
+    settings::apply(&mut core);
     core.sidebar.set_shown(shot.sidebar);
     // Videos only play when asked (--play-at), and never out loud.
     (core.viewer.autoplay, core.viewer.silent) = (false, true);
@@ -745,7 +781,8 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
                 && core.sidebar.is_idle()
                 && core.status.is_empty()
                 && !core.viewer.loading()
-                && core.map.as_ref().is_none_or(|m| m.is_idle());
+                && core.map.as_ref().is_none_or(|m| m.is_idle())
+                && core.settings_page.as_ref().is_none_or(|p| p.is_idle());
             quiet = if done { quiet + 1 } else { 0 };
         }
         Ok(())
@@ -827,6 +864,24 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
             core.viewer.close_since(ms);
         }
         core.update(Instant::now());
+    }
+
+    if let Some(page) = &shot.page {
+        settings_ui::open(&mut core);
+        settle(&mut core)?;
+        if let Some(at) = &page.scroll {
+            core.settings_page.as_mut().unwrap().scroll_to(at);
+            settle(&mut core)?;
+        }
+        for &at in &page.clicks {
+            core.settings_page.as_mut().unwrap().click(at);
+            settle(&mut core)?;
+        }
+        if let Some(at) = page.hover {
+            // The page reads the pointer from the sidebar, which the window keeps up to date.
+            core.sidebar.cursor = at;
+            settle(&mut core)?;
+        }
     }
 
     if let Some((scale, end)) = shot.pinch {
@@ -911,6 +966,21 @@ fn source_from(args: &[String]) -> Result<Source> {
     Ok(Source::Immich(immich::Immich::new(&url, &key)?))
 }
 
+/// Saved settings plus any `--set key=value` overrides (headless only; not saved unless
+/// `--save-settings` is given).
+fn settings_from(args: &[String]) -> Result<settings::Settings> {
+    let save = args.iter().any(|a| a == "--save-settings");
+    settings::READ_ONLY.store(!save, std::sync::atomic::Ordering::Relaxed);
+    let mut s = settings::Settings::load();
+    for kv in args.windows(2).filter(|w| w[0] == "--set").map(|w| &w[1]) {
+        s.set(kv)?;
+    }
+    if save {
+        s.save()?;
+    }
+    Ok(s)
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("lumen=info,wgpu=error")).init();
     let args: Vec<String> = std::env::args().collect();
@@ -942,6 +1012,8 @@ fn main() -> Result<()> {
                 let (v, end) = s.strip_suffix(",end").map_or((s.as_str(), false), |v| (v, true));
                 Some((v.parse().ok()?, end))
             }),
+            settings: settings_from(&args)?,
+            page: settings_ui::Shot::parse(&args),
         };
         return screenshot(source, &path, size, scale, shot);
     }

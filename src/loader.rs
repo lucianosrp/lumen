@@ -31,13 +31,6 @@ impl Tier {
             Tier::Xl => 1024,
         }
     }
-    /// Atlas height; the XL atlas only needs a handful of on-screen tiles.
-    pub const fn atlas_height(self) -> u32 {
-        match self {
-            Tier::Xl => 4096,
-            _ => 8192,
-        }
-    }
     pub const MIPS: u32 = 4;
 }
 
@@ -196,6 +189,16 @@ impl Loader {
         }
     }
 
+    /// Forgets `collection`'s cached timeline (in memory and on disk) and syncs it again
+    /// from the server, reporting progress through the status line.
+    pub fn reload(&self, collection: Collection) {
+        self.shared.fresh.lock().unwrap().remove(&collection.query);
+        if let Source::Immich(immich) = &self.source {
+            let _ = std::fs::remove_file(library_cache_path(immich, &collection.query));
+        }
+        self.open(collection);
+    }
+
     pub fn source(&self) -> &Source {
         &self.source
     }
@@ -298,9 +301,7 @@ async fn sync(source: Source, shared: Arc<Shared>, collection: Arc<Collection>, 
 async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Collection>, request: u64) -> bool {
     // Show the last known version instantly, then refresh from the server.
     let query = &collection.query;
-    let key = format!("{:016x}", fxhash(immich.base()));
-    let name = if query == LIBRARY_QUERY { format!("library-{key}.json") } else { format!("library-{key}-{:016x}.json", fxhash(query)) };
-    let path = cache_dir().join(name);
+    let path = library_cache_path(immich, query);
     let cached: Option<Arc<Vec<Asset>>> =
         std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(Arc::new);
     if let Some(assets) = cached.clone() {
@@ -332,6 +333,12 @@ async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Col
             false
         }
     }
+}
+
+fn library_cache_path(immich: &Immich, query: &str) -> PathBuf {
+    let key = format!("{:016x}", fxhash(immich.base()));
+    let name = if query == LIBRARY_QUERY { format!("library-{key}.json") } else { format!("library-{key}-{:016x}.json", fxhash(query)) };
+    cache_dir().join(name)
 }
 
 async fn worker(source: Source, shared: Arc<Shared>) {
@@ -400,11 +407,15 @@ async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) ->
 pub async fn thumbnail_bytes(immich: &Immich, id: &str) -> Result<Vec<u8>> {
     let path = cache_dir().join("thumbs").join(id);
     if let Ok(b) = tokio::fs::read(&path).await {
+        // mtime doubles as last-used time for the cache size limit.
+        crate::storage::touch(&path);
         return Ok(b);
     }
     let b = immich.thumbnail(id).await?;
     let _ = tokio::fs::create_dir_all(path.parent().unwrap()).await;
-    let _ = tokio::fs::write(&path, &b).await;
+    if tokio::fs::write(&path, &b).await.is_ok() {
+        crate::storage::thumb_written(b.len() as u64);
+    }
     Ok(b)
 }
 

@@ -685,6 +685,11 @@ impl Viewer {
         }
     }
 
+    /// Settings → Default volume: what the next video starts at.
+    pub fn set_default_volume(&mut self, v: f64) {
+        self.volume = v.clamp(0.0, 1.0);
+    }
+
     fn set_volume(&mut self, v: f64) {
         self.volume = v.clamp(0.0, 1.0);
         if self.muted && self.volume > 0.0 {

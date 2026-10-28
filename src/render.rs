@@ -5,6 +5,7 @@ use crate::library::Library;
 use crate::ui::Frame;
 use crate::ui_render::UiRenderer;
 use crate::loader::Tier;
+use crate::settings::GpuMemory;
 
 pub const NO_SLOT: u32 = u32::MAX;
 pub const LARGE_BIT: u32 = 0x8000_0000;
@@ -29,15 +30,41 @@ struct Globals {
     large: [f32; 4],
     xl: [f32; 4],
     xl_size: [f32; 4],
+    /// Small atlas width, height; large atlas width, height.
+    sizes: [f32; 4],
 }
 
-const ATLAS: u32 = 8192;
+/// Atlas texture size per tier for a memory budget, clamped to what the GPU supports.
+/// All sizes are multiples of the largest slot (1024), so slots tile them exactly.
+pub fn atlas_dims(mem: GpuMemory, tier: Tier, max: u32) -> (u32, u32) {
+    let (w, h) = match (mem, tier) {
+        // ~255 MB: fits an integrated GPU.
+        (GpuMemory::Low, Tier::Small) => (4096, 4096),
+        (GpuMemory::Low, Tier::Large) => (4096, 5120),
+        (GpuMemory::Low, Tier::Xl) => (4096, 3072),
+        // ~895 MB.
+        (GpuMemory::Normal, Tier::Xl) => (8192, 4096),
+        (GpuMemory::Normal, _) => (8192, 8192),
+        // ~1.4 GB.
+        (GpuMemory::High, Tier::Large) => (8192, 16384),
+        (GpuMemory::High, _) => (8192, 8192),
+    };
+    let max = (max / 1024 * 1024).max(1024);
+    (w.min(max), h.min(max))
+}
+
+/// Video memory of one atlas including its mips.
+pub fn atlas_bytes((w, h): (u32, u32)) -> u64 {
+    (0..Tier::MIPS).map(|l| (w as u64 >> l) * (h as u64 >> l) * 4).sum()
+}
 
 /// A big texture cut into equal square slots, recycled least-recently-seen first.
 pub struct SlotAtlas {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
     tier: Tier,
+    width: u32,
+    height: u32,
     owner: Vec<usize>,
     last_used: Vec<u64>,
     loaded: Vec<Instant>,
@@ -48,10 +75,10 @@ pub struct SlotAtlas {
 }
 
 impl SlotAtlas {
-    fn new(device: &wgpu::Device, tier: Tier) -> Self {
+    fn new(device: &wgpu::Device, tier: Tier, (width, height): (u32, u32)) -> Self {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("slot atlas"),
-            size: wgpu::Extent3d { width: ATLAS, height: tier.atlas_height(), depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: Tier::MIPS,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -60,11 +87,13 @@ impl SlotAtlas {
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
-        let cap = ((ATLAS / tier.slot()) * (tier.atlas_height() / tier.slot())) as usize;
+        let cap = ((width / tier.slot()) * (height / tier.slot())) as usize;
         Self {
             tex,
             view,
             tier,
+            width,
+            height,
             owner: vec![usize::MAX; cap],
             last_used: vec![0; cap],
             loaded: vec![Instant::now(); cap],
@@ -80,7 +109,11 @@ impl SlotAtlas {
     }
 
     fn per_row(&self) -> u32 {
-        ATLAS / self.tier.slot()
+        self.width / self.tier.slot()
+    }
+
+    pub fn bytes(&self) -> u64 {
+        atlas_bytes((self.width, self.height))
     }
 
     fn reset(&mut self, n: usize) {
@@ -148,7 +181,7 @@ impl SlotAtlas {
     }
 
     fn globals(&self) -> [f32; 4] {
-        [self.tier.slot() as f32, self.per_row() as f32, ATLAS as f32, Tier::MIPS as f32]
+        [self.tier.slot() as f32, self.per_row() as f32, self.width as f32, Tier::MIPS as f32]
     }
 }
 
@@ -169,10 +202,19 @@ pub struct Renderer {
     instances: wgpu::Buffer,
     instance_count: u32,
     pub ui: UiRenderer,
+    pub gpu_memory: GpuMemory,
+    /// The GPU in use, for the About page.
+    pub adapter: wgpu::AdapterInfo,
 }
 
 impl Renderer {
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+        adapter: wgpu::AdapterInfo,
+        gpu_memory: GpuMemory,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("grid.wgsl"));
         let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -271,10 +313,14 @@ impl Renderer {
         let instances = Self::instance_buffer(&device, 4096);
         let ui = UiRenderer::new(&device, &queue, format, &globals);
 
+        let max = device.limits().max_texture_dimension_2d;
+        let atlas = |tier| SlotAtlas::new(&device, tier, atlas_dims(gpu_memory, tier, max));
         Self {
-            small: SlotAtlas::new(&device, Tier::Small),
-            large: SlotAtlas::new(&device, Tier::Large),
-            xl: SlotAtlas::new(&device, Tier::Xl),
+            small: atlas(Tier::Small),
+            large: atlas(Tier::Large),
+            xl: atlas(Tier::Xl),
+            gpu_memory,
+            adapter,
             device,
             queue,
             tile_pipeline,
@@ -331,6 +377,37 @@ impl Renderer {
         self.small.reset(lib.len());
         self.large.reset(lib.len());
         self.xl.reset(lib.len());
+        self.rebind();
+    }
+
+    /// Recreates the thumbnail atlases for a new memory budget; what they held reloads.
+    pub fn set_gpu_memory(&mut self, mem: GpuMemory) {
+        if mem == self.gpu_memory {
+            return;
+        }
+        self.gpu_memory = mem;
+        let max = self.device.limits().max_texture_dimension_2d;
+        let n = self.small.slot_of.len();
+        for tier in [Tier::Small, Tier::Large, Tier::Xl] {
+            let mut atlas = SlotAtlas::new(&self.device, tier, atlas_dims(mem, tier, max));
+            atlas.reset(n);
+            *match tier {
+                Tier::Small => &mut self.small,
+                Tier::Large => &mut self.large,
+                Tier::Xl => &mut self.xl,
+            } = atlas;
+        }
+        log::info!("thumbnail atlases now {} MB ({mem:?})", self.atlas_bytes() >> 20);
+        if self.th_view.is_some() {
+            self.rebind();
+        }
+    }
+
+    pub fn atlas_bytes(&self) -> u64 {
+        self.small.bytes() + self.large.bytes() + self.xl.bytes()
+    }
+
+    fn rebind(&mut self) {
         self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
@@ -380,7 +457,8 @@ impl Renderer {
             small: self.small.globals(),
             large: self.large.globals(),
             xl: self.xl.globals(),
-            xl_size: [ATLAS as f32, Tier::Xl.atlas_height() as f32, 0.0, 0.0],
+            xl_size: [self.xl.width as f32, self.xl.height as f32, 0.0, 0.0],
+            sizes: [self.small.width as f32, self.small.height as f32, self.large.width as f32, self.large.height as f32],
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
         let bytes = std::mem::size_of_val(tiles) as u64;
