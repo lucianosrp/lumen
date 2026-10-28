@@ -60,15 +60,16 @@ impl Immich {
         Ok(res)
     }
 
-    /// Fetches the whole timeline's metadata. `progress` gets (assets so far, total).
-    pub async fn timeline(&self, progress: impl Fn(usize, usize)) -> Result<Vec<Asset>> {
-        let buckets: Vec<Bucket> = self.get("/timeline/buckets?visibility=timeline").await?.json().await?;
+    /// Fetches a timeline's metadata, e.g. `query` = "visibility=timeline" or "albumId=…".
+    /// `progress` gets (assets so far, total).
+    pub async fn timeline(&self, query: &str, progress: impl Fn(usize, usize)) -> Result<Vec<Asset>> {
+        let buckets: Vec<Bucket> = self.get(&format!("/timeline/buckets?{query}")).await?.json().await?;
         let total = buckets.iter().map(|b| b.count).sum();
         let mut done = 0;
         let mut assets = Vec::with_capacity(total);
         let mut results = stream::iter(buckets)
             .map(|b| async move {
-                let path = format!("/timeline/bucket?visibility=timeline&timeBucket={}", b.time_bucket);
+                let path = format!("/timeline/bucket?{query}&timeBucket={}", b.time_bucket);
                 let cols: BucketAssets = self.get(&path).await?.json().await?;
                 anyhow::Ok(cols)
             })
