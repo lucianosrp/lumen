@@ -137,6 +137,16 @@ pub struct Layout {
     pub default_cols: u32,
     /// How long a mid-pinch reflow takes (Settings → Pinch zoom speed).
     pub reflow_time: Duration,
+    /// The zoom the last run ended at, used once by the first collection to arrive.
+    pub restore: Option<Zoom>,
+}
+
+/// A zoom that survives window and library size changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Zoom {
+    /// The whole library on one screen.
+    Fit,
+    Cols(u32),
 }
 
 const ZOOM_TIME: Duration = Duration::from_millis(340);
@@ -151,7 +161,7 @@ fn ease(t: f32) -> f32 {
 
 impl Layout {
     pub fn new(vp: Viewport) -> Self {
-        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0, top: false }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None, default_cols: 9, reflow_time: PINCH_REFLOW_TIME }
+        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0, top: false }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None, default_cols: 9, reflow_time: PINCH_REFLOW_TIME, restore: None }
     }
 
     /// Columns at which the whole library fits on one screen.
@@ -188,6 +198,11 @@ impl Layout {
         self.level + 1 == self.levels.len()
     }
 
+    /// The current zoom, to remember for next time.
+    pub fn zoom_state(&self) -> Zoom {
+        if self.is_fit_all() && self.levels.len() > 1 { Zoom::Fit } else { Zoom::Cols(self.target.cols) }
+    }
+
     /// New library: start at the bottom (most recent), like Apple Photos, or at the top when
     /// `from_top` (search results, best match first). Keeping the place holds the bottom edge
     /// still, or the top one when `from_top`.
@@ -198,7 +213,16 @@ impl Layout {
         self.n = n;
         self.rebuild_levels();
         if self.n == 0 || !keep_from_bottom || fresh {
-            self.level = self.nearest_level(self.default_cols);
+            self.level = match (self.n, self.restore) {
+                (1.., Some(z)) => {
+                    self.restore = None;
+                    match z {
+                        Zoom::Fit => self.levels.len() - 1,
+                        Zoom::Cols(c) => self.nearest_level(c),
+                    }
+                }
+                _ => self.nearest_level(self.default_cols),
+            };
             self.target.cols = self.levels[self.level];
             self.target.scroll = if self.target.top { f32::MIN } else { f32::MAX };
         } else if self.target.top {

@@ -607,6 +607,11 @@ impl ApplicationHandler for App {
             }
         }
         let mut core = Core::new(loader, renderer, (config.width, config.height), window.scale_factor() as f32);
+        // The grid starts where the last run left it (fully zoomed out stays zoomed out).
+        core.layout.restore = match state::get("grid")["zoom"].clone() {
+            serde_json::Value::String(s) if s == "fit" => Some(grid::Zoom::Fit),
+            v => v.as_u64().map(|c| grid::Zoom::Cols(c as u32)),
+        };
         if self.signed_out {
             core.sign_in_screen();
         }
@@ -657,6 +662,14 @@ impl ApplicationHandler for App {
 
     /// Remembers the window's size for next time (not while fullscreen).
     fn exiting(&mut self, _: &ActiveEventLoop) {
+        // The grid's zoom, unless nothing was ever shown (signed out, or still loading).
+        if let Some(core) = self.core.as_ref().filter(|c| c.login.is_none() && c.layout.n > 0) {
+            let zoom = match core.layout.zoom_state() {
+                grid::Zoom::Fit => serde_json::json!("fit"),
+                grid::Zoom::Cols(c) => serde_json::json!(c),
+            };
+            state::set("grid", serde_json::json!({ "zoom": zoom }));
+        }
         let Some(w) = &self.window else { return };
         if w.fullscreen().is_some() {
             return;
