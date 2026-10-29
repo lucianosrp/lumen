@@ -23,6 +23,7 @@ mod ui_render;
 mod video;
 mod viewer;
 mod widgets;
+mod zoombar;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -99,6 +100,8 @@ struct Core {
     login: Option<login::Login>,
     /// Asked for by the sign-in screen or Settings; the window rebuilds the app on it.
     switch: Option<Switch>,
+    /// The auto-hiding zoom slider at the top right of the grid.
+    zoombar: zoombar::ZoomBar,
 }
 
 /// Swapping the whole app for another account (or none).
@@ -162,6 +165,7 @@ impl Core {
             header_extra: 0.0,
             login: None,
             switch: None,
+            zoombar: zoombar::ZoomBar::default(),
         };
         settings::apply(&mut core);
         core
@@ -428,7 +432,8 @@ impl Core {
         let acting = actions::draw(self, now);
 
         self.build_header();
-        sidebar_moving || viewing || acting || fading || hovering || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
+        let bar = zoombar::update(self, now, dt);
+        bar || sidebar_moving || viewing || acting || fading || hovering || self.layout.animating(now) || !self.pending.is_empty() || self.velocity != 0.0 || self.smooth_scroll != 0.0
     }
 
     /// Handles a sidebar click (or `--select`).
@@ -499,7 +504,7 @@ impl Core {
         base.text(Text::new(title, x, 14.0 * s, 26.0 * s).weight(700).color(theme::text()));
         base.text(Text::new(subtitle, x, 48.0 * s, 13.0 * s).weight(500).color(theme::text_dim()));
         if !self.status.is_empty() {
-            let right = self.size.0 as f32 - 20.0 * s;
+            let right = self.size.0 as f32 - 20.0 * s - self.zoombar.reserve(s);
             base.text(
                 Text::new(self.status.clone(), right, 22.0 * s, 14.0 * s)
                     .weight(500)
@@ -740,6 +745,10 @@ impl App {
             window.request_redraw();
             return;
         }
+        if zoombar::input(core, &event, self.cursor) {
+            window.request_redraw();
+            return;
+        }
         if search::input(core, &event, self.modifiers) || actions::input(core, &event, self.modifiers) {
             window.request_redraw();
             return;
@@ -975,6 +984,8 @@ struct Shot {
     /// change, to check that a live palette switch recolours everything.
     theme_wait: Option<u64>,
     search: Option<search::Shot>,
+    /// `--zoombar`: show the zoom slider.
+    zoombar: bool,
 }
 
 fn screenshot(source: Source, login: Option<login::Shot>, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
@@ -1201,6 +1212,13 @@ fn screenshot(source: Source, login: Option<login::Shot>, path: &str, size: (u32
         core.pump();
         core.update(Instant::now());
     }
+    if shot.zoombar {
+        core.zoombar.hold = true;
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(16));
+            core.update(Instant::now());
+        }
+    }
     if let Some(secs) = shot.theme_wait {
         let generation = theme::generation();
         println!("waiting up to {secs} s for the theme to change");
@@ -1335,6 +1353,7 @@ fn main() -> Result<()> {
             hover_wait: flag("--hover-wait").and_then(|s| s.parse().ok()).unwrap_or(0),
             theme_wait: flag("--theme-wait").and_then(|s| s.parse().ok()),
             search: search::Shot::parse(&args),
+            zoombar: args.iter().any(|a| a == "--zoombar"),
         };
         let login = signed_out.then(|| login::Shot::parse(&args));
         return screenshot(source, login, &path, size, scale, shot);

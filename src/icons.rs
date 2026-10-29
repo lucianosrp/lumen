@@ -37,6 +37,7 @@ const ICONS: &[(&str, &str)] = &[
     ("map", include_str!("../assets/icons/map.svg")),
     ("map-pin", include_str!("../assets/icons/map-pin.svg")),
     ("maximize-2", include_str!("../assets/icons/maximize-2.svg")),
+    ("minus", include_str!("../assets/icons/minus.svg")),
     ("minimize-2", include_str!("../assets/icons/minimize-2.svg")),
     ("palette", include_str!("../assets/icons/palette.svg")),
     ("pause", include_str!("../assets/icons/pause.svg")),

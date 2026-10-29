@@ -12,6 +12,7 @@ glyphon (text), GStreamer (video). Config: `~/.config/lumen/config.json` (`url`,
 - `sidebar.rs`, `viewer.rs`, `video.rs` (GStreamer), `map.rs` (Places), `gestures.rs` (Wayland pinch; remove once on winit 0.31)
 - `actions.rs`: selection, favorite, archive, trash/restore, add-to-album, context menus, toasts with undo. Optimistic edits go through `Library::edit` and `Renderer::remap_library`
 - `search.rs`: smart search (Immich CLIP): sidebar search field (`widgets::TextField`), suggestions popover, results as a `Collection::results` kept in relevance order (`Library::ordered`, grid from the top), filter chips, paging. Headless: `--search "<q>"`, `--search-type "<text>"`, see `search::Shot`
+- `zoombar.rs`: the auto-hiding zoom slider at the top right of the grid (headless: `--zoombar`). `state.rs`: `state.json` (recent searches, window size, grid zoom)
 - `hover.rs`: hover-to-play previews and badges. `live.rs`: Immich socket.io push events lead to `Loader::refresh`
 - `settings.rs` / `settings_ui.rs` / `widgets.rs` / `storage.rs`: preferences (`~/.config/lumen/settings.json`), the Settings page, reusable controls, cache sizes and limits
 - `account.rs` / `login.rs`: saved account, key check (`account::verify`), sign out; the sign-in screen shown while no key is saved (`Core.login`). Signing in/out sets `Core.switch` and the window rebuilds `Core` (`Core::rebuild`) on the same renderer. Headless: `--login [--login-paste config|<key>] [--login-server] [--login-local/--login-remote <addr>]`
