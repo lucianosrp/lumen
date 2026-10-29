@@ -137,8 +137,12 @@ pub struct Layout {
     pub default_cols: u32,
     /// How long a mid-pinch reflow takes (Settings → Pinch zoom speed).
     pub reflow_time: Duration,
-    /// The zoom the last run ended at, used once by the first collection to arrive.
+    /// The zoom to open collections at: the last run's at first, then whatever the previous
+    /// collection was left at, so switching (Library → Favorites → Library) keeps it.
     pub restore: Option<Zoom>,
+    /// The level the current collection opened at: if it's still there when the collection
+    /// is left, the zoom wasn't touched and `restore` stays as it was.
+    opened_at: Option<usize>,
 }
 
 /// A zoom that survives window and library size changes.
@@ -161,7 +165,7 @@ fn ease(t: f32) -> f32 {
 
 impl Layout {
     pub fn new(vp: Viewport) -> Self {
-        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0, top: false }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None, default_cols: 9, reflow_time: PINCH_REFLOW_TIME, restore: None }
+        Self { vp, n: 0, target: Grid { cols: 5, scroll: 0.0, top: false }, from: None, levels: vec![5], level: 0, pinch: None, from_scale: None, default_cols: 9, reflow_time: PINCH_REFLOW_TIME, restore: None, opened_at: None }
     }
 
     /// Columns at which the whole library fits on one screen.
@@ -200,13 +204,21 @@ impl Layout {
 
     /// The current zoom, to remember for next time.
     pub fn zoom_state(&self) -> Zoom {
-        if self.is_fit_all() && self.levels.len() > 1 { Zoom::Fit } else { Zoom::Cols(self.target.cols) }
+        // Only the extra "whole collection" level counts as fit: in a small collection a
+        // regular size can be the last level, and that shouldn't zoom the library all the way out.
+        let extra = self.levels.last().is_some_and(|c| !LEVELS.contains(c));
+        if self.is_fit_all() && extra { Zoom::Fit } else { Zoom::Cols(self.target.cols) }
     }
 
     /// New library: start at the bottom (most recent), like Apple Photos, or at the top when
     /// `from_top` (search results, best match first). Keeping the place holds the bottom edge
     /// still, or the top one when `from_top`.
     pub fn reset(&mut self, n: usize, keep_from_bottom: bool) {
+        // The zoom being left behind carries over to whatever opens next, if it was changed
+        // here (so passing through a small collection doesn't lose "fully zoomed out").
+        if self.n > 0 && self.levels.len() > 1 && self.opened_at != Some(self.level) {
+            self.restore = Some(self.zoom_state());
+        }
         let from_bottom = self.target.content_height(self.n, &self.vp) - self.target.scroll;
         // Results arriving in an empty (still searching) view start fresh too.
         let fresh = self.target.top && self.n == 0;
@@ -215,7 +227,6 @@ impl Layout {
         if self.n == 0 || !keep_from_bottom || fresh {
             self.level = match (self.n, self.restore) {
                 (1.., Some(z)) => {
-                    self.restore = None;
                     match z {
                         Zoom::Fit => self.levels.len() - 1,
                         Zoom::Cols(c) => self.nearest_level(c),
@@ -223,6 +234,7 @@ impl Layout {
                 }
                 _ => self.nearest_level(self.default_cols),
             };
+            self.opened_at = (self.n > 0).then_some(self.level);
             self.target.cols = self.levels[self.level];
             self.target.scroll = if self.target.top { f32::MIN } else { f32::MAX };
         } else if self.target.top {
@@ -420,5 +432,39 @@ impl Layout {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_carries_across_collections() {
+        let vp = Viewport { width: 1360.0, height: 1000.0, top: 76.0 };
+        let now = Instant::now();
+        let mut l = Layout::new(vp);
+        l.default_cols = 9;
+        l.reset(30_000, false);
+        assert_eq!(l.target.cols, 9);
+        // Fully out in the library, then Favorites (small) and back.
+        l.zoom_to(l.levels() - 1, 0.0, 0.0, now);
+        assert_eq!(l.zoom_state(), Zoom::Fit);
+        l.reset(120, false);
+        assert!(l.is_fit_all());
+        l.reset(30_000, false);
+        assert!(l.is_fit_all(), "library should still be fully zoomed out");
+        // Zooming in a small collection carries that size back.
+        l.reset(400, false);
+        l.zoom(-1, 0.0, 0.0, now);
+        let cols = l.target.cols;
+        assert!(LEVELS.contains(&cols));
+        l.reset(30_000, false);
+        assert_eq!(l.target.cols, cols);
+        // Untouched, a collection hands on what it was given.
+        l.zoom_to(l.nearest_level(19), 0.0, 0.0, now);
+        l.reset(5, false);
+        l.reset(30_000, false);
+        assert_eq!(l.target.cols, 19);
     }
 }
