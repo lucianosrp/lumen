@@ -380,7 +380,7 @@ fn swap_library(core: &mut Core, new: Arc<Library>, map: Vec<Option<usize>>, gen
         let y = (i / cols) as f32 * t - core.layout.target.scroll;
         ((i..map.len()).chain((0..i).rev()).find_map(|k| map[k]), y)
     });
-    core.renderer.remap_library(&new, &map);
+    core.renderer.set_library(&new);
     core.generation = generation.unwrap_or_else(|| core.loader.adopt(new.clone()));
     let g = core.generation;
     core.pending.retain_mut(|th| match map.get(th.index).copied().flatten() {

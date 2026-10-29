@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
@@ -68,6 +69,10 @@ pub fn atlas_bytes((w, h): (u32, u32)) -> u64 {
 }
 
 /// A big texture cut into equal square slots, recycled least-recently-seen first.
+///
+/// Slots remember which asset (by id) they hold, so switching collections re-attaches every
+/// thumbnail still in the atlas instead of loading it again. Slots whose asset isn't in the
+/// current collection stay "parked" until space is needed.
 pub struct SlotAtlas {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
@@ -75,6 +80,8 @@ pub struct SlotAtlas {
     width: u32,
     height: u32,
     owner: Vec<usize>,
+    /// Asset id held by each slot ("" when empty), current collection or not.
+    holds: Vec<String>,
     last_used: Vec<u64>,
     loaded: Vec<Instant>,
     slot_of: Vec<u32>,
@@ -104,6 +111,7 @@ impl SlotAtlas {
             width,
             height,
             owner: vec![usize::MAX; cap],
+            holds: vec![String::new(); cap],
             last_used: vec![0; cap],
             loaded: vec![Instant::now(); cap],
             slot_of: Vec::new(),
@@ -125,30 +133,30 @@ impl SlotAtlas {
         atlas_bytes((self.width, self.height))
     }
 
-    fn reset(&mut self, n: usize) {
-        self.owner.fill(usize::MAX);
-        self.free = (0..self.capacity() as u32).rev().collect();
-        self.slot_of = vec![NO_SLOT; n];
+    /// Attaches to a new collection (or an edited one), given its asset ids in order: slots
+    /// holding one of them serve it again; the rest stay parked, first in line for eviction.
+    fn adopt(&mut self, ids: &[String]) {
+        let at: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+        self.slot_of = vec![NO_SLOT; ids.len()];
+        self.free.clear();
+        for s in 0..self.capacity() {
+            self.owner[s] = usize::MAX;
+            match at.get(self.holds[s].as_str()) {
+                _ if self.holds[s].is_empty() => self.free.push(s as u32),
+                Some(&j) => {
+                    self.owner[s] = j;
+                    self.slot_of[j] = s as u32;
+                }
+                None => {}
+            }
+        }
+        self.free.reverse();
         self.evict.clear();
     }
 
-    /// Follows a local library edit: thumbnails stay loaded under their assets' new indices.
-    fn remap(&mut self, map: &[Option<usize>], n: usize) {
-        let mut slot_of = vec![NO_SLOT; n];
-        for (old, &s) in self.slot_of.iter().enumerate().filter(|(_, s)| **s != NO_SLOT) {
-            match map.get(old).copied().flatten() {
-                Some(j) => {
-                    slot_of[j] = s;
-                    self.owner[s as usize] = j;
-                }
-                None => {
-                    self.owner[s as usize] = usize::MAX;
-                    self.free.push(s);
-                }
-            }
-        }
-        self.slot_of = slot_of;
-        self.evict.clear();
+    /// How many of the current collection's assets have a thumbnail in this atlas.
+    pub fn attached(&self) -> usize {
+        self.slot_of.iter().filter(|&&s| s != NO_SLOT).count()
     }
 
     pub fn get(&self, asset: usize) -> Option<u32> {
@@ -163,7 +171,7 @@ impl SlotAtlas {
         self.loaded[slot as usize]
     }
 
-    fn alloc(&mut self, asset: usize, frame: u64) -> Option<u32> {
+    fn alloc(&mut self, asset: usize, id: &str, frame: u64) -> Option<u32> {
         let slot = match self.free.pop() {
             Some(s) => s,
             None => {
@@ -183,6 +191,7 @@ impl SlotAtlas {
                 s
             }
         };
+        self.holds[slot as usize] = id.to_string();
         self.owner[slot as usize] = asset;
         self.slot_of[asset] = slot;
         self.last_used[slot as usize] = frame;
@@ -227,6 +236,8 @@ pub struct Renderer {
     pub small: SlotAtlas,
     pub large: SlotAtlas,
     pub xl: SlotAtlas,
+    /// The current collection's asset ids, by index.
+    ids: Vec<String>,
     instances: wgpu::Buffer,
     instance_count: u32,
     pub ui: UiRenderer,
@@ -347,6 +358,7 @@ impl Renderer {
             small: atlas(Tier::Small),
             large: atlas(Tier::Large),
             xl: atlas(Tier::Xl),
+            ids: Vec::new(),
             gpu_memory,
             adapter,
             device,
@@ -374,20 +386,14 @@ impl Renderer {
         })
     }
 
+    /// Shows another collection (or an edited copy of this one, see `Library::edit`). Thumbnails
+    /// already on the GPU are kept and found again by asset id.
     pub fn set_library(&mut self, lib: &Library) {
         self.upload_thumbhashes(lib);
-        self.small.reset(lib.len());
-        self.large.reset(lib.len());
-        self.xl.reset(lib.len());
-        self.rebind();
-    }
-
-    /// Swaps in an edited copy of the library (see `Library::edit`) without dropping thumbnails.
-    pub fn remap_library(&mut self, lib: &Library, map: &[Option<usize>]) {
-        self.upload_thumbhashes(lib);
-        self.small.remap(map, lib.len());
-        self.large.remap(map, lib.len());
-        self.xl.remap(map, lib.len());
+        self.ids = lib.assets.iter().map(|a| a.id.clone()).collect();
+        for atlas in [&mut self.small, &mut self.large, &mut self.xl] {
+            atlas.adopt(&self.ids);
+        }
         self.rebind();
     }
 
@@ -429,10 +435,9 @@ impl Renderer {
         }
         self.gpu_memory = mem;
         let max = self.device.limits().max_texture_dimension_2d;
-        let n = self.small.slot_of.len();
         for tier in [Tier::Small, Tier::Large, Tier::Xl] {
             let mut atlas = SlotAtlas::new(&self.device, tier, atlas_dims(mem, tier, max));
-            atlas.reset(n);
+            atlas.adopt(&self.ids);
             *match tier {
                 Tier::Small => &mut self.small,
                 Tier::Large => &mut self.large,
@@ -477,7 +482,8 @@ impl Renderer {
         if index >= atlas.slot_of.len() || atlas.get(index).is_some() {
             return true;
         }
-        let Some(slot) = atlas.alloc(index, frame) else { return false };
+        let Some(id) = self.ids.get(index) else { return true };
+        let Some(slot) = atlas.alloc(index, id, frame) else { return false };
         atlas.upload(&self.queue, slot, mips);
         atlas.loaded[slot as usize] = now;
         true

@@ -1044,10 +1044,18 @@ fn screenshot(source: Source, login: Option<login::Shot>, path: &str, size: (u32
         Ok(())
     };
     settle(&mut core)?;
-    if let Some(spec) = &shot.select {
+    // `--select a,b,…` visits several rows in turn (e.g. "favorites,library").
+    for spec in shot.select.iter().flat_map(|s| s.split(',')) {
         if let Some(action) = core.sidebar.select(spec, size.1 as f32, scale)? {
             core.apply(action);
         }
+        // Right after the switch, before anything loads: thumbnails carried over.
+        for _ in 0..3 {
+            core.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let r = &core.renderer;
+        println!("{spec}: {} small / {} large thumbnails already on the GPU", r.small.attached(), r.large.attached());
         settle(&mut core)?;
     }
     if let Some(s) = &shot.search {
