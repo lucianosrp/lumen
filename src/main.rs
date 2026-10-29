@@ -33,6 +33,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Fullscreen, Theme, Window, WindowId};
 
 use grid::{Layout, Viewport};
@@ -566,6 +567,8 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("Lumen")
+            // Wayland app id: matches lumen.desktop, so launchers and docks show its icon.
+            .with_name("lumen", "lumen")
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 920.0))
             .with_theme(Some(Theme::Dark));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));

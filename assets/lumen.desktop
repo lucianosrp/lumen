@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Lumen
+GenericName=Photo Viewer
+Comment=Your Immich photo library
+Exec=lumen
+Icon=lumen
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=photos;immich;gallery;pictures;
+StartupWMClass=lumen
