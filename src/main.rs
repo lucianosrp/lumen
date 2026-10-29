@@ -418,7 +418,9 @@ impl Core {
             if start.elapsed() > Duration::from_millis(budget) {
                 break;
             }
-            if !self.renderer.upload_thumb(t.index, t.tier, &t.mips, frame, now) {
+            // From disk: there at once, no fade from the placeholder.
+            let at = if t.cached { now.checked_sub(Duration::from_secs_f32(FADE)).unwrap_or(now) } else { now };
+            if !self.renderer.upload_thumb(t.index, t.tier, &t.mips, frame, at) {
                 break;
             }
             self.pending.pop_front();

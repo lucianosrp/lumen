@@ -158,6 +158,13 @@ pub fn set_thumb_limit(bytes: u64) {
     }
 }
 
+/// Whether background downloads may add `len` more bytes to the thumbnail cache without
+/// making it trim (which would evict thumbnails to make room for others). Unlimited: always.
+pub fn has_room(len: u64) -> bool {
+    let (limit, used) = (LIMIT.load(Ordering::Relaxed), USED.load(Ordering::Relaxed));
+    limit == 0 || (used != UNKNOWN && used + len < (limit as f64 * TRIM_TO * 0.95) as u64)
+}
+
 /// A thumbnail of `len` bytes was just written.
 pub fn thumb_written(len: u64) {
     let used = USED.load(Ordering::Relaxed);

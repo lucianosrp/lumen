@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use image::imageops::FilterType;
 
@@ -43,6 +44,8 @@ pub struct Thumb {
     pub tier: Tier,
     /// Square RGBA8 image per mip level, largest first.
     pub mips: Vec<Vec<u8>>,
+    /// Came from the disk cache: shown at once, without fading in.
+    pub cached: bool,
 }
 
 pub enum Msg {
@@ -160,6 +163,8 @@ struct Shared {
     wake: Box<dyn Fn() + Send + Sync>,
     /// Cache patches still writing.
     patching: std::sync::atomic::AtomicUsize,
+    /// The background download of every thumbnail in the library.
+    prefetch: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl Shared {
@@ -190,6 +195,7 @@ impl Loader {
             tx: Mutex::new(tx),
             wake: Box::new(wake),
             patching: Default::default(),
+            prefetch: Mutex::new(None),
         });
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         for _ in 0..WORKERS {
@@ -521,6 +527,12 @@ async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Col
             assets.retain(|a| seen.insert(a.id.clone()));
             let assets = Arc::new(assets);
             shared.fresh.lock().unwrap().insert(query.clone(), (Instant::now(), assets.clone()));
+            if query == LIBRARY_QUERY {
+                let task = tokio::spawn(prefetch_all(immich.clone(), shared.clone(), assets.clone()));
+                if let Some(old) = shared.prefetch.lock().unwrap().replace(task.abort_handle()) {
+                    old.abort();
+                }
+            }
             let _ = std::fs::create_dir_all(cache_dir());
             let _ = std::fs::write(&index_path, serde_json::to_vec(&idx).unwrap());
             if cached.as_ref().is_none_or(|c| *c != assets) {
@@ -577,13 +589,15 @@ async fn worker(source: Source, shared: Arc<Shared>) {
             }
         }
         match result {
-            Ok(mips) => shared.send(Msg::Thumb(Thumb { generation, index, tier, mips })),
+            Ok((mips, cached)) => shared.send(Msg::Thumb(Thumb { generation, index, tier, mips, cached })),
             Err(e) => log::warn!("thumbnail {}: {e:#}", lib.assets[index].id),
         }
     }
 }
 
-async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) -> Result<Vec<Vec<u8>>> {
+/// Decoded mips, and whether the image came from the disk cache.
+async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) -> Result<(Vec<Vec<u8>>, bool)> {
+    let mut cached = false;
     let image = match source {
         Source::Demo(_) => {
             // Pretend there's a network in between.
@@ -591,10 +605,11 @@ async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) ->
             image::DynamicImage::ImageRgba8(library::demo_image(index as u64, tier.slot()))
         }
         Source::Immich(immich) => {
-            let bytes = match tier {
-                Tier::Xl => immich.get_bytes(&format!("/assets/{}/thumbnail?size=preview", asset.id)).await?,
-                _ => thumbnail_bytes(immich, &asset.id).await?,
+            let (bytes, from_disk) = match tier {
+                Tier::Xl => preview_bytes(immich, &asset.id).await?,
+                _ => thumbnail_bytes_from(immich, &asset.id).await?,
             };
+            cached = from_disk;
             tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??
         }
     };
@@ -611,23 +626,85 @@ async fn load_thumb(source: &Source, asset: &Asset, index: usize, tier: Tier) ->
         mips
     })
     .await?;
-    Ok(mips)
+    Ok((mips, cached))
 }
 
 /// An asset's ~250px thumbnail, from the shared disk cache or the server.
 pub async fn thumbnail_bytes(immich: &Immich, id: &str) -> Result<Vec<u8>> {
-    let path = cache_dir().join("thumbs").join(id);
+    Ok(thumbnail_bytes_from(immich, id).await?.0)
+}
+
+/// Same, and whether it came from disk.
+async fn thumbnail_bytes_from(immich: &Immich, id: &str) -> Result<(Vec<u8>, bool)> {
+    cached(cache_dir().join("thumbs").join(id), immich.thumbnail(id)).await
+}
+
+/// The ~1440px server preview the grid's largest tiles use, cached alongside the thumbnails
+/// (and under the same size limit, least recently used first).
+async fn preview_bytes(immich: &Immich, id: &str) -> Result<(Vec<u8>, bool)> {
+    let path = cache_dir().join("thumbs").join("previews").join(id);
+    cached(path, immich.get_bytes(&format!("/assets/{id}/thumbnail?size=preview"))).await
+}
+
+/// Reads `path`, or fetches and writes it. Returns the bytes and whether they were on disk.
+async fn cached(path: PathBuf, fetch: impl Future<Output = Result<Vec<u8>>>) -> Result<(Vec<u8>, bool)> {
     if let Ok(b) = tokio::fs::read(&path).await {
         // mtime doubles as last-used time for the cache size limit.
         crate::storage::touch(&path);
-        return Ok(b);
+        return Ok((b, true));
     }
-    let b = immich.thumbnail(id).await?;
+    let b = fetch.await?;
     let _ = tokio::fs::create_dir_all(path.parent().unwrap()).await;
     if tokio::fs::write(&path, &b).await.is_ok() {
         crate::storage::thumb_written(b.len() as u64);
     }
-    Ok(b)
+    Ok((b, false))
+}
+
+/// Background thumbnail downloads in flight at once: enough to hide a remote link's latency.
+const PREFETCH_AT_ONCE: usize = 12;
+/// Typical thumbnail size, for deciding whether the cache has room for more.
+const THUMB_GUESS: u64 = 24 << 10;
+
+/// Downloads (without decoding) every thumbnail of the library that isn't on disk yet, newest
+/// first, several at a time, pausing whenever the grid wants something. Stops when the cache
+/// limit is near, rather than evicting thumbnails to fit others.
+async fn prefetch_all(immich: Immich, shared: Arc<Shared>, assets: Arc<Vec<Asset>>) {
+    let dir = cache_dir().join("thumbs");
+    let missing: Vec<String> = assets.iter().rev().map(|a| a.id.clone()).filter(|id| !dir.join(id).exists()).collect();
+    if missing.is_empty() {
+        return;
+    }
+    log::info!("downloading {} thumbnails in the background", missing.len());
+    let busy = || {
+        let q = shared.queue.lock().unwrap();
+        !q.want.is_empty() || !q.inflight.is_empty() || q.syncing
+    };
+    let full = std::sync::atomic::AtomicBool::new(false);
+    let results: Vec<bool> = futures::stream::iter(missing)
+        .map(|id| {
+            let (immich, busy, full) = (&immich, &busy, &full);
+            async move {
+                // Whatever the grid is waiting for goes first.
+                while busy() {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                if full.load(std::sync::atomic::Ordering::Relaxed) || !crate::storage::has_room(THUMB_GUESS * PREFETCH_AT_ONCE as u64) {
+                    full.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                thumbnail_bytes_from(immich, &id).await.inspect_err(|e| log::debug!("background thumbnail: {e:#}")).is_ok()
+            }
+        })
+        .buffer_unordered(PREFETCH_AT_ONCE)
+        .collect()
+        .await;
+    let done = results.iter().filter(|&&ok| ok).count();
+    if full.load(std::sync::atomic::Ordering::Relaxed) {
+        log::info!("background thumbnails: stopped at the cache limit after {done}");
+        return;
+    }
+    log::info!("background thumbnails: {done} downloaded, library complete");
 }
 
 fn fxhash(s: &str) -> u64 {
