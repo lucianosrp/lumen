@@ -14,6 +14,7 @@ mod render;
 mod search;
 mod settings;
 mod settings_ui;
+mod state;
 mod sidebar;
 mod theme;
 mod storage;
@@ -565,11 +566,15 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        // The size it had last time (logical px), else a comfortable default.
+        let saved = state::get("window");
+        let dim = |k: &str, min: f64| saved[k].as_f64().filter(|v| *v >= min && *v < 20_000.0);
+        let (w, h) = (dim("width", 400.0).unwrap_or(1440.0), dim("height", 300.0).unwrap_or(920.0));
         let attrs = Window::default_attributes()
             .with_title("Lumen")
             // Wayland app id: matches lumen.desktop, so launchers and docks show its icon.
             .with_name("lumen", "lumen")
-            .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 920.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(w, h))
             .with_theme(Some(Theme::Dark));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
@@ -648,6 +653,18 @@ impl ApplicationHandler for App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Remembers the window's size for next time (not while fullscreen).
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        let Some(w) = &self.window else { return };
+        if w.fullscreen().is_some() {
+            return;
+        }
+        // Size only: tiling compositors (Hyprland) report tiled windows as maximized, and
+        // asking to start maximized would take over the screen.
+        let size = w.inner_size().to_logical::<f64>(w.scale_factor());
+        state::set("window", serde_json::json!({ "width": size.width.round(), "height": size.height.round() }));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {

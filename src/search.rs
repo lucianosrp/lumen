@@ -8,7 +8,6 @@
 //! its model; the grid says so after a few seconds, and focusing the field warms it up early.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -1263,38 +1262,15 @@ fn draw_popover(core: &mut Core) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Recent searches: `~/.config/lumen/state.json`, written atomically.
-
-fn state_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("lumen/state.json"))
-}
+// Recent searches: the `recent_searches` key of `state.json`.
 
 fn load_recent() -> Vec<String> {
-    let Some(v) = state_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
-        return Vec::new();
-    };
-    v["recent_searches"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).take(RECENT_MAX).collect()).unwrap_or_default()
+    let v = crate::state::get("recent_searches");
+    v.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).take(RECENT_MAX).collect()).unwrap_or_default()
 }
 
 fn save_recent(recent: &[String]) {
-    // Headless runs leave the user's files alone.
-    if crate::settings::READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let Some(path) = state_path() else { return };
-    let mut v = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(|v| v.is_object()).unwrap_or(json!({}));
-    v["recent_searches"] = json!(recent);
-    let write = || -> Result<()> {
-        let dir = path.parent().context("no config dir")?;
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".state.json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&v)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        log::warn!("saving recent searches: {e:#}");
-    }
+    crate::state::set("recent_searches", json!(recent));
 }
 
 // ---------------------------------------------------------------------------------------------
