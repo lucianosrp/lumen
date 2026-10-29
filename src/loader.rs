@@ -453,7 +453,7 @@ async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Col
 }
 
 fn library_cache_path(immich: &Immich, query: &str) -> PathBuf {
-    let key = format!("{:016x}", fxhash(immich.base()));
+    let key = format!("{:016x}", fxhash(&immich.identity()));
     let name = if query == LIBRARY_QUERY { format!("library-{key}.json") } else { format!("library-{key}-{:016x}.json", fxhash(query)) };
     cache_dir().join(name)
 }

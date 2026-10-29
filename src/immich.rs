@@ -1,15 +1,36 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream};
 use serde::Deserialize;
 
 use crate::library::Asset;
 
+/// A client for one server reachable at several addresses: a local one (LAN IP) first and
+/// fallbacks (a public domain) after it. Requests go to the current route; when it stops
+/// answering, the others are probed and the first that answers takes over. Clones share the
+/// route, so the whole app moves together.
 #[derive(Clone)]
 pub struct Immich {
-    base: String,
+    routes: Arc<Routes>,
     key: String,
     http: reqwest::Client,
 }
+
+struct Routes {
+    /// Base URLs in order of preference (no trailing `/api`).
+    urls: RwLock<Vec<String>>,
+    current: AtomicUsize,
+    /// One probe at a time; requests failing meanwhile wait for its verdict.
+    probing: tokio::sync::Mutex<()>,
+}
+
+/// How long a probe waits for `/server/ping` on each address.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
+/// While on a fallback, how often to check whether the preferred address is back (home again).
+const RECHECK: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,32 +57,128 @@ struct BucketAssets {
 }
 
 impl Immich {
-    pub fn new(url: &str, key: &str) -> Result<Self> {
-        let base = url.trim_end_matches('/').trim_end_matches("/api").to_string();
+    /// `urls`: addresses in order of preference; empty ones are skipped.
+    pub fn new(urls: &[&str], key: &str) -> Result<Self> {
+        let urls: Vec<String> = urls.iter().map(|u| normalize(u)).filter(|u| !u.is_empty()).collect();
+        if urls.is_empty() {
+            bail!("no server address");
+        }
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(32)
-            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Self { base, key: key.to_string(), http })
+        let routes = Routes { urls: RwLock::new(urls), current: AtomicUsize::new(0), probing: Default::default() };
+        Ok(Self { routes: Arc::new(routes), key: key.to_string(), http })
     }
 
-    pub fn base(&self) -> &str {
-        &self.base
+    /// The same server, key and current route on a new connection pool: pooled connections
+    /// belong to the runtime that opened them, so a client moving to another runtime (the
+    /// sign-in screen's to the app's) needs its own.
+    pub fn fresh(&self) -> Result<Self> {
+        let urls = self.urls();
+        let fresh = Self::new(&urls.iter().map(String::as_str).collect::<Vec<_>>(), &self.key)?;
+        fresh.routes.current.store(self.routes.current.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(fresh)
+    }
+
+    /// The address requests go to right now.
+    pub fn base(&self) -> String {
+        let urls = self.routes.urls.read().unwrap();
+        urls[self.routes.current.load(Ordering::Relaxed).min(urls.len() - 1)].clone()
+    }
+
+    /// The preferred address: names this server in cache keys, whichever route is in use.
+    pub fn identity(&self) -> String {
+        self.routes.urls.read().unwrap()[0].clone()
+    }
+
+    /// All configured addresses, preferred first.
+    pub fn urls(&self) -> Vec<String> {
+        self.routes.urls.read().unwrap().clone()
+    }
+
+    /// True when requests currently go to a fallback address.
+    pub fn on_fallback(&self) -> bool {
+        self.routes.current.load(Ordering::Relaxed) > 0
+    }
+
+    /// Replaces the addresses (Settings › Server) and finds the best one again.
+    pub async fn set_urls(&self, urls: &[&str]) -> Result<()> {
+        let urls: Vec<String> = urls.iter().map(|u| normalize(u)).filter(|u| !u.is_empty()).collect();
+        if urls.is_empty() {
+            bail!("no server address");
+        }
+        *self.routes.urls.write().unwrap() = urls;
+        self.routes.current.store(0, Ordering::Relaxed);
+        self.connect().await.map(|_| ())
+    }
+
+    /// Probes every address at once and switches to the most preferred one that answers.
+    /// Returns its index. Errors (keeping the current route) when none does.
+    pub async fn connect(&self) -> Result<usize> {
+        let _probe = self.routes.probing.lock().await;
+        self.probe().await
+    }
+
+    async fn probe(&self) -> Result<usize> {
+        let urls = self.urls();
+        let pings = urls.iter().map(|u| {
+            let req = self.http.get(format!("{u}/api/server/ping")).timeout(PROBE_TIMEOUT);
+            async move { req.send().await.is_ok_and(|r| r.status().is_success()) }
+        });
+        let up = futures::future::join_all(pings).await;
+        let Some(best) = up.iter().position(|&ok| ok) else {
+            bail!("no answer from {}", urls.join(" or "));
+        };
+        if self.routes.current.swap(best, Ordering::Relaxed) != best {
+            log::info!("server: using {}{}", urls[best], if best > 0 { " (fallback)" } else { "" });
+        }
+        Ok(best)
+    }
+
+    /// After a request to `failed` couldn't connect: probes again unless another request
+    /// already moved on. Returns whether a retry should go somewhere else.
+    async fn reroute(&self, failed: &str) -> bool {
+        if self.routes.urls.read().unwrap().len() < 2 {
+            return false;
+        }
+        let _probe = self.routes.probing.lock().await;
+        if self.base() != failed {
+            return true;
+        }
+        self.probe().await.is_ok() && self.base() != failed
+    }
+
+    /// Background task: while on a fallback, returns to the preferred address once it
+    /// answers again (e.g. back on the home network).
+    pub async fn watch_routes(self) {
+        loop {
+            tokio::time::sleep(RECHECK).await;
+            if self.on_fallback() {
+                let _ = self.connect().await;
+            }
+        }
+    }
+
+    /// Sends a request built for the current address; if it can't connect and another address
+    /// answers, sends it once more there.
+    async fn send(&self, build: impl Fn(&str) -> reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+        let base = self.base();
+        match build(&base).send().await {
+            Err(e) if (e.is_connect() || e.is_timeout()) && self.reroute(&base).await => build(&self.base()).send().await,
+            r => r,
+        }
     }
 
     /// GET `/api{path}` with auth; errors on non-2xx.
     pub async fn get(&self, path: &str) -> Result<reqwest::Response> {
-        let url = format!("{}/api{}", self.base, path);
         let res = self
-            .http
-            .get(&url)
-            .header("x-api-key", &self.key)
-            .header("accept", "*/*")
-            .send()
+            .send(|base| self.http.get(format!("{base}/api{path}")).header("x-api-key", &self.key).header("accept", "*/*"))
             .await
-            .with_context(|| format!("GET {url}"))?;
+            .with_context(|| format!("GET {path}"))?;
         if !res.status().is_success() {
-            bail!("GET {url}: {}", res.status());
+            bail!("GET {path}: {}", res.status());
         }
         Ok(res)
     }
@@ -112,18 +229,19 @@ impl Immich {
         body: &serde_json::Value,
         timeout: Option<std::time::Duration>,
     ) -> Result<reqwest::Response> {
-        let url = format!("{}/api{}", self.base, path);
-        let mut req = self.http.request(method.clone(), &url).header("x-api-key", &self.key);
-        if let Some(t) = timeout {
-            req = req.timeout(t);
-        }
-        if !body.is_null() {
-            req = req.json(body);
-        }
-        let res = req
-            .send()
+        let res = self
+            .send(|base| {
+                let mut req = self.http.request(method.clone(), format!("{base}/api{path}")).header("x-api-key", &self.key);
+                if let Some(t) = timeout {
+                    req = req.timeout(t);
+                }
+                if !body.is_null() {
+                    req = req.json(body);
+                }
+                req
+            })
             .await
-            .with_context(|| format!("{method} {url}"))?;
+            .with_context(|| format!("{method} {path}"))?;
         if !res.status().is_success() {
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
@@ -177,6 +295,18 @@ impl Immich {
         let res = self.get(&format!("/assets/{id}/thumbnail?size=thumbnail")).await?;
         Ok(res.bytes().await?.to_vec())
     }
+}
+
+/// "192.168.1.5:2283" → "http://192.168.1.5:2283"; "photos.example.com/" → "https://photos.example.com".
+/// Bare IPs and hosts with a port default to http, domains to https.
+pub fn normalize(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/').trim_end_matches("/api").trim_end_matches('/');
+    if url.is_empty() || url.contains("://") {
+        return url.to_string();
+    }
+    let host = url.split(['/', ':']).next().unwrap_or("");
+    let plain = url.contains(':') || host == "localhost" || host.parse::<std::net::Ipv4Addr>().is_ok() || host.ends_with(".local") || host.ends_with(".lan");
+    format!("{}://{url}", if plain { "http" } else { "https" })
 }
 
 /// 11001 (ms) or "0:00:11.001" → 11001; None for zero or unparsable.

@@ -172,6 +172,12 @@ pub fn reload() -> bool {
 /// Loads the theme now and keeps watching it; `wake` redraws the window after a change.
 pub fn watch(wake: Arc<dyn Fn() + Send + Sync>) {
     reload();
+    // Once per process: signing in again rebuilds the app, not the watcher. (The first app's
+    // waker reaches the same window.)
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     std::thread::Builder::new()
         .name("theme-watch".into())
         .spawn(move || {

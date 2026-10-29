@@ -57,6 +57,11 @@ const ICONS: &[(&str, &str)] = &[
     ("volume-1", include_str!("../assets/icons/volume-1.svg")),
     ("volume-2", include_str!("../assets/icons/volume-2.svg")),
     ("volume-x", include_str!("../assets/icons/volume-x.svg")),
+    ("key-round", include_str!("../assets/icons/key-round.svg")),
+    ("log-out", include_str!("../assets/icons/log-out.svg")),
+    ("globe", include_str!("../assets/icons/globe.svg")),
+    ("house", include_str!("../assets/icons/house.svg")),
+    ("arrow-right", include_str!("../assets/icons/arrow-right.svg")),
     ("x", include_str!("../assets/icons/x.svg")),
 ];
 

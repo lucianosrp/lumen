@@ -13,14 +13,16 @@ use serde::Deserialize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-use crate::Core;
+use crate::account::Config;
+use crate::immich::normalize;
+use crate::{Core, Switch};
 use crate::loader::{Loader, Source, Tier, cache_dir, group};
 use crate::render::{atlas_bytes, atlas_dims};
 use crate::settings::{self, GpuMemory, Quality, ThumbSize};
 use crate::storage::{self, Sizes, format_bytes};
 use crate::ui::{Align, Text, rgb, theme};
 use crate::icons::IconStyle;
-use crate::widgets::{ButtonKind, Card, Ctx, Input, colors};
+use crate::widgets::{ButtonKind, Card, Ctx, Edit, Input, TextField, colors};
 
 /// Logical pixels.
 const HEADER: f32 = 76.0;
@@ -52,6 +54,8 @@ struct Stats {
 #[derive(Deserialize)]
 struct Me {
     name: String,
+    #[serde(default)]
+    email: String,
 }
 
 /// `GET /api/server/storage`: the disk holding the library.
@@ -108,7 +112,8 @@ const DISK_WARN: f64 = 90.0;
 
 struct ServerInfo {
     version: String,
-    user: Option<String>,
+    /// Name and email of the key's owner.
+    user: Option<(String, String)>,
     stats: Option<Stats>,
     latency: Duration,
 }
@@ -125,6 +130,8 @@ enum Bg {
     Server(Result<ServerInfo, String>),
     Storage(ServerStorage),
     Cleared(&'static str, u64),
+    /// New addresses saved and probed: test the connection again.
+    Rerouted,
 }
 
 /// What the page asks for after a frame; done once the controls have been drawn.
@@ -133,6 +140,16 @@ enum Act {
     Reload,
     Test,
     OpenFolder,
+    /// Save the edited addresses and switch to the best one.
+    SetUrls,
+    SignOut,
+}
+
+/// The Server section's address fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Addr {
+    Local,
+    Remote,
 }
 
 pub enum Response {
@@ -166,6 +183,16 @@ pub struct Page {
     flash: Option<(&'static str, String, Instant)>,
     /// Settings changed since the last save.
     dirty: bool,
+    local: TextField,
+    remote: TextField,
+    /// The address field taking the keyboard.
+    editing: Option<Addr>,
+    /// Enter was pressed in an address field.
+    commit: bool,
+    /// "Sign Out…" was clicked once at this time.
+    confirm_out: Option<Instant>,
+    /// Fall back to the remote address when the local one doesn't answer.
+    use_fallback: bool,
 }
 
 impl Page {
@@ -191,10 +218,30 @@ impl Page {
             clearing: None,
             flash: None,
             dirty: false,
+            local: TextField::default(),
+            remote: TextField::default(),
+            editing: None,
+            commit: false,
+            confirm_out: None,
+            use_fallback: true,
         };
+        page.reset_addresses();
         page.measure();
         page.test(loader);
         page
+    }
+
+    /// The address fields as saved.
+    fn reset_addresses(&mut self) {
+        let c = Config::load();
+        self.local.set(&c.url);
+        self.remote.set(&c.fallback_url);
+        self.use_fallback = c.use_fallback;
+    }
+
+    /// An address field has the keyboard: keys go here before any shortcut.
+    pub fn editing(&self) -> bool {
+        self.editing.is_some()
     }
 
     /// True once cache sizes and server details have arrived (for headless screenshots).
@@ -233,12 +280,17 @@ impl Page {
                     );
                     Ok(ServerInfo {
                         version: format!("v{}.{}.{}", v.major, v.minor, v.patch),
-                        user: me.ok().map(|m| m.name).filter(|n| !n.is_empty()),
+                        user: me.ok().filter(|m| !m.name.is_empty()).map(|m| (m.name, m.email)),
                         stats: stats.ok(),
                         latency,
                     })
                 }
-                Err(e) => Err(format!("{e:#}")),
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    let host = immich.base();
+                    let host = host.trim_start_matches("http://").trim_start_matches("https://");
+                    Err(if e.contains("error sending request") { format!("No answer from {host}") } else { e })
+                }
             };
             let _ = tx.send(Bg::Server(info));
             wake();
@@ -293,6 +345,25 @@ impl Page {
                     MouseScrollDelta::PixelDelta(p) => {
                         self.scroll_to -= p.y as f32 / scale;
                         self.scroll = self.scroll_to;
+                    }
+                }
+                Response::Handled
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && self.editing.is_some() => {
+                match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::Enter) => self.commit = true,
+                    Key::Named(NamedKey::Escape) => {
+                        self.editing = None;
+                        self.reset_addresses();
+                    }
+                    Key::Named(NamedKey::Tab) => {
+                        self.editing = Some(if self.editing == Some(Addr::Local) { Addr::Remote } else { Addr::Local });
+                    }
+                    _ => {
+                        let f = if self.editing == Some(Addr::Local) { &mut self.local } else { &mut self.remote };
+                        if f.key(event, mods) == Edit::Ignored && (mods.control_key() || mods.super_key()) {
+                            return Response::Ignored;
+                        }
                     }
                 }
                 Response::Handled
@@ -419,6 +490,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     let dt = now.duration_since(page.last).as_secs_f32().min(0.05);
     page.last = now;
 
+    let mut retest = false;
     while let Ok(msg) = page.rx.try_recv() {
         match msg {
             Bg::Sizes(s) => {
@@ -431,6 +503,7 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
                 page.server_storage = Some(st);
                 page.storage_loading = false;
             }
+            Bg::Rerouted => retest = true,
             Bg::Cleared(what, freed) => {
                 page.clearing = None;
                 page.flash = Some((what, format!("Freed {}", format_bytes(freed)), now));
@@ -446,6 +519,9 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     }
     if page.confirm_all.is_some_and(|t| now.duration_since(t) > CONFIRM_FOR) {
         page.confirm_all = None;
+    }
+    if page.confirm_out.is_some_and(|t| now.duration_since(t) > CONFIRM_FOR) {
+        page.confirm_out = None;
     }
     if page.flash.as_ref().is_some_and(|f| now.duration_since(f.2) > FLASH_FOR) {
         page.flash = None;
@@ -468,9 +544,10 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     let slots = [core.renderer.small.capacity(), core.renderer.large.capacity(), core.renderer.xl.capacity()];
     let adapter = core.renderer.adapter.clone();
     let demo = matches!(core.loader.source(), Source::Demo(_));
-    let server_url = match core.loader.source() {
-        Source::Immich(i) => i.base().to_string(),
-        Source::Demo(_) => "Demo library (no server)".into(),
+    // The address in use, and whether it's the fallback.
+    let route = match core.loader.source() {
+        Source::Immich(i) => Some((i.base(), i.on_fallback())),
+        Source::Demo(_) => None,
     };
     let collection_title = core.collection.title.clone();
     let lib_counts = core.library.as_ref().map(|l| (l.len() - l.videos, l.videos));
@@ -479,6 +556,13 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     let before = core.settings.clone();
     let quads_before = core.ui.base.quads.len();
     let mut acts = Vec::new();
+    if retest {
+        acts.push(Act::Test);
+    }
+    if std::mem::take(&mut page.commit) {
+        page.editing = None;
+        acts.push(Act::SetUrls);
+    }
     let area = [left, 0.0, w - left, h];
     let mut ctx = Ctx {
         layer: &mut core.ui.base,
@@ -762,22 +846,47 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
     // --- Server --------------------------------------------------------------------------
     section(&mut ctx, &mut y, "server", "server", pal.tints[5], "Server");
     let mut card = Card::begin(&ctx, x, y, cw);
-    let r = card.row(&mut ctx, ROW);
-    let mid = r[1] + r[3] / 2.0;
-    ctx.row_label(r, "Immich server", None, true);
-    ctx.text(server_url, right, mid, 13.0, 400, colors::text_secondary(), Align::Right);
+    if !demo {
+        let r = card.row(&mut ctx, ROW_SUB);
+        let mid = r[1] + r[3] / 2.0;
+        let confirming = page.confirm_out.is_some();
+        let (title, sub) = match &page.server {
+            Server::Ok(ServerInfo { user: Some((name, email)), .. }) => (format!("Signed in as {name}"), email.clone()),
+            _ => ("Signed in".to_string(), "With an API key".to_string()),
+        };
+        let sub = if confirming { "Click again to sign out · you'll need an API key to sign back in".to_string() } else { sub };
+        let (label, kind) = if confirming { ("Sign Out", ButtonKind::DestructiveFilled) } else { ("Sign Out…", ButtonKind::Destructive) };
+        let until = right - ctx.button_width(label);
+        ctx.row_label_until(r, &title, Some(&sub), true, until);
+        if ctx.button_right(right, mid, label, kind, true).0 {
+            if confirming {
+                acts.push(Act::SignOut);
+            } else {
+                page.confirm_out = Some(now);
+                let wake = page.wake.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(CONFIRM_FOR + Duration::from_millis(20));
+                    wake();
+                });
+            }
+        }
+    }
     let r = card.row(&mut ctx, ROW_SUB);
     let mid = r[1] + r[3] / 2.0;
+    let via = match &route {
+        Some((url, fallback)) => {
+            let host = url.trim_start_matches("http://").trim_start_matches("https://");
+            if *fallback { format!(" · via {host} (remote)") } else { format!(" · via {host}") }
+        }
+        None => String::new(),
+    };
     let (dot, status, sub) = match &page.server {
-        Server::Demo => (pal.muted, "Offline demo".to_string(), "Run with an Immich server configured to connect".to_string()),
+        Server::Demo => (pal.muted, "Offline demo".to_string(), "Sign in to an Immich server to see your library".to_string()),
         Server::Loading => (colors::pending(), "Connecting…".to_string(), "Asking the server for its version".to_string()),
         Server::Ok(i) => (
             colors::green(),
             format!("Connected · {} ms", i.latency.as_millis().max(1)),
-            match &i.user {
-                Some(u) => format!("Immich {} · signed in as {u}", i.version),
-                None => format!("Immich {}", i.version),
-            },
+            format!("Immich {}{via}", i.version),
         ),
         Server::Failed(e) => (colors::red(), "Can't reach the server".to_string(), e.clone()),
     };
@@ -793,9 +902,62 @@ pub fn update(core: &mut Core, now: Instant) -> bool {
         Server::Failed(_) => ("Try Again", ButtonKind::Primary),
         _ => ("Test Connection", ButtonKind::Secondary),
     };
-    if ctx.button_right(right, mid, label, kind, !testing && !demo).0
-    {
+    if ctx.button_right(right, mid, label, kind, !testing && !demo).0 {
         acts.push(Act::Test);
+    }
+
+    // The addresses: edited in place, saved on Enter or clicking away.
+    let field_w = (cw * 0.46).min(290.0 * s).round();
+    let mut clicked_field = false;
+    for (which, title, placeholder) in [
+        (Addr::Local, "Local address", "192.168.1.10:2283"),
+        (Addr::Remote, "Remote address", "photos.example.com"),
+    ] {
+        if which == Addr::Remote {
+            let r = card.row(&mut ctx, ROW_SUB);
+            let sub = "When the local address doesn't answer, e.g. away from home";
+            ctx.row_label_until(r, "Fall back to a remote address", Some(sub), !demo, right - 40.0 * s);
+            if ctx.toggle("use_fallback", right, r[1] + r[3] / 2.0, &mut page.use_fallback, !demo) {
+                page.editing = None;
+                acts.push(Act::SetUrls);
+            }
+            if !page.use_fallback {
+                continue;
+            }
+        }
+        let r = card.row(&mut ctx, ROW_SUB);
+        let mid = r[1] + r[3] / 2.0;
+        let field = if which == Addr::Local { &mut page.local } else { &mut page.remote };
+        let in_use = matches!(page.server, Server::Ok(_)) && route.as_ref().is_some_and(|(url, _)| !field.text.trim().is_empty() && normalize(&field.text) == *url);
+        let sub = match (which, in_use) {
+            (_, true) => "In use",
+            (Addr::Local, false) => "Tried first, e.g. at home",
+            (Addr::Remote, false) => "Used when the local address doesn't answer",
+        };
+        ctx.row_label_until(r, title, Some(sub), !demo, right - field_w - 8.0 * s);
+        if in_use {
+            // A green dot before "In use".
+            let w = ctx.measure(title, 13.5, 500);
+            ctx.quad([r[0] + 16.0 * s + w + 8.0 * s, mid - 11.5 * s, 6.0 * s, 6.0 * s], rgb(colors::green(), 1.0), 3.0 * s);
+        }
+        let fr = [right - field_w, (mid - 15.0 * s).round(), field_w, (30.0 * s).round()];
+        let focused = page.editing == Some(which);
+        if focused {
+            let ring = (2.0 * s).round().max(1.0);
+            ctx.quad([fr[0] - ring, fr[1] - ring, fr[2] + 2.0 * ring, fr[3] + 2.0 * ring], rgb(pal.accent, 0.85), 8.0 * s + ring);
+        }
+        ctx.quad(fr, rgb(colors::track(), 1.0), 8.0 * s);
+        let area = [fr[0] + 10.0 * s, fr[1], fr[2] - 20.0 * s, fr[3]];
+        field.draw(ctx.layer, ctx.uir, area, 13.0, s, placeholder, focused);
+        if !demo && ctx.input.clicked(fr) {
+            page.editing = Some(which);
+            clicked_field = true;
+        }
+    }
+    // Clicking anywhere else saves what was typed.
+    if page.editing.is_some() && !clicked_field && ctx.input.release.is_some() {
+        page.editing = None;
+        acts.push(Act::SetUrls);
     }
     let r = card.row(&mut ctx, ROW);
     let mid = r[1] + r[3] / 2.0;
@@ -897,6 +1059,37 @@ fn run(core: &mut Core, act: Act) {
             let c = (*core.collection).clone();
             log::info!("reloading {} from the server", c.key);
             core.loader.reload(c);
+        }
+        Act::SetUrls => {
+            let page = page_mut(core);
+            let mut config = Config::saved();
+            let (local, remote) = (page.local.text.trim().to_string(), page.remote.text.trim().to_string());
+            let use_fallback = page.use_fallback;
+            if local.is_empty() || (local == config.url && remote == config.fallback_url && use_fallback == config.use_fallback) {
+                page.reset_addresses();
+                return;
+            }
+            (config.url, config.fallback_url, config.use_fallback) = (local, remote, use_fallback);
+            if let Err(e) = config.save() {
+                log::warn!("saving addresses: {e:#}");
+            }
+            let Source::Immich(immich) = core.loader.source() else { return };
+            let page = core.settings_page.as_mut().unwrap();
+            page.server = Server::Loading;
+            let (immich, tx, wake) = (immich.clone(), page.tx.clone(), page.wake.clone());
+            let urls = config.urls().iter().map(|u| u.to_string()).collect::<Vec<_>>();
+            core.loader.handle().spawn(async move {
+                let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+                if let Err(e) = immich.set_urls(&urls).await {
+                    log::info!("new addresses: {e:#}");
+                }
+                let _ = tx.send(Bg::Rerouted);
+                wake();
+            });
+        }
+        Act::SignOut => {
+            leave(core);
+            core.switch = Some(Switch::SignOut);
         }
         Act::Test => {
             let page = core.settings_page.as_mut().unwrap();

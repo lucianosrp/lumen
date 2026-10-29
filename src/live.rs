@@ -28,7 +28,11 @@ pub fn start(immich: Immich, rt: &tokio::runtime::Handle, wake: Arc<dyn Fn() + S
         loop {
             match listen(&immich, &event_tx).await {
                 Ok(()) => backoff = Duration::from_secs(2),
-                Err(e) => log::info!("live updates: {e:#}; retrying in {}s", backoff.as_secs()),
+                Err(e) => {
+                    log::info!("live updates: {e:#}; retrying in {}s", backoff.as_secs());
+                    // The address may have gone away (left the home network): find another.
+                    let _ = immich.connect().await;
+                }
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(60));
@@ -57,7 +61,10 @@ async fn listen(immich: &Immich, events: &tokio::sync::mpsc::UnboundedSender<Str
     let ws_base = immich.base().replacen("http", "ws", 1);
     let mut req = format!("{ws_base}/api/socket.io/?EIO=4&transport=websocket").into_client_request()?;
     req.headers_mut().insert("x-api-key", HeaderValue::from_str(immich.api_key())?);
-    let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    // An address that doesn't answer would otherwise hang until the OS gives up (minutes).
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(req))
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer from {ws_base}"))??;
 
     let mut connected = false;
     while let Some(msg) = ws.next().await {

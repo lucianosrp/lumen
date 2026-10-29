@@ -312,7 +312,7 @@ async fn load_thumb(immich: &Immich, id: String, px: u32) -> Result<Msg> {
 
 /// Shows the cached marker list instantly, then refreshes it from the server.
 async fn load_markers(immich: Immich, shared: Arc<Shared>) {
-    let key = immich.base().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let key = immich.identity().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
     let path = loader::cache_dir().join(format!("map-markers-{key:016x}.json"));
     let cached: Option<Vec<RawMarker>> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
     if let Some(m) = &cached {

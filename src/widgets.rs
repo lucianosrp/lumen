@@ -568,6 +568,8 @@ pub struct TextField {
     all: bool,
     /// Horizontal scroll in physical px that keeps the caret in view.
     scroll: f32,
+    /// Shown as dots (API keys).
+    pub mask: bool,
 }
 
 /// What a key did to a `TextField`.
@@ -733,14 +735,21 @@ impl TextField {
             // Trailing spaces count: measure against a stop character.
             if t.is_empty() { 0.0 } else { uir.measure(&format!("{t}|"), fs, 400, Font::Sans) - uir.measure("|", fs, 400, Font::Sans) }
         };
+        // Masked text draws as one dot per character, with the caret moved to match.
+        let (shown, caret) = if self.mask {
+            let dots = "•".repeat(self.text.chars().count());
+            (dots, "•".len() * self.text[..self.caret].chars().count())
+        } else {
+            (self.text.clone(), self.caret)
+        };
         if self.text.is_empty() {
             self.scroll = 0.0;
             // Just right of the caret, so the two don't overlap.
             let x = area[0] + if focused { 3.0 * s } else { 0.0 };
             out.text(Text::new(placeholder, x, ty, fs).color(theme::text_faint()).clip(area));
         } else {
-            let caret_x = width(uir, &self.text[..self.caret]);
-            let total = width(uir, &self.text);
+            let caret_x = width(uir, &shown[..caret]);
+            let total = width(uir, &shown);
             let room = (area[2] - 2.0 * s).max(1.0);
             self.scroll = self.scroll.min(caret_x).max(caret_x - room).clamp(0.0, (total - room).max(0.0));
             let x = area[0] - self.scroll;
@@ -750,10 +759,10 @@ impl TextField {
                 out.quad(Quad::solid(sel, rgb(p.accent, if p.dark { 0.45 } else { 0.3 }), 3.0 * s));
                 out.clip_last(area);
             }
-            out.text(Text::new(self.text.clone(), x, ty, fs).color(theme::text()).clip(area));
+            out.text(Text::new(shown.clone(), x, ty, fs).color(theme::text()).clip(area));
         }
         if focused && !self.all {
-            let cx = (area[0] + width(uir, &self.text[..self.caret]) - self.scroll).round();
+            let cx = (area[0] + width(uir, &shown[..caret]) - self.scroll).round();
             let h = (fs * 1.25).round();
             out.quad(Quad::solid([cx, (area[1] + (area[3] - h) / 2.0).round(), (1.5 * s).max(1.0), h], rgb(theme::accent(), 1.0), 0.0));
         }

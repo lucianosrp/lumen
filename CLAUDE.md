@@ -1,7 +1,7 @@
 # Lumen
 
 Apple-Photos-style photo viewer for Linux, backed by an Immich server. Rust, wgpu 30, winit 0.30,
-glyphon (text), GStreamer (video). Config: `~/.config/lumen/config.json` (`url`, `api_key`).
+glyphon (text), GStreamer (video). Config: `~/.config/lumen/config.json` (`url`, `fallback_url`, `use_fallback`, `api_key`; mode 600, see `account.rs`).
 
 ## Layout
 - `main.rs`: `Core` (app state, per-frame `update`, header), `App` (winit window and input), headless `screenshot()` and CLI flags
@@ -14,6 +14,8 @@ glyphon (text), GStreamer (video). Config: `~/.config/lumen/config.json` (`url`,
 - `search.rs`: smart search (Immich CLIP): sidebar search field (`widgets::TextField`), suggestions popover, results as a `Collection::results` kept in relevance order (`Library::ordered`, grid from the top), filter chips, paging. Headless: `--search "<q>"`, `--search-type "<text>"`, see `search::Shot`
 - `hover.rs`: hover-to-play previews and badges. `live.rs`: Immich socket.io push events lead to `Loader::refresh`
 - `settings.rs` / `settings_ui.rs` / `widgets.rs` / `storage.rs`: preferences (`~/.config/lumen/settings.json`), the Settings page, reusable controls, cache sizes and limits
+- `account.rs` / `login.rs`: saved account, key check (`account::verify`), sign out; the sign-in screen shown while no key is saved (`Core.login`). Signing in/out sets `Core.switch` and the window rebuilds `Core` (`Core::rebuild`) on the same renderer. Headless: `--login [--login-paste config|<key>] [--login-server] [--login-local/--login-remote <addr>]`
+- `immich.rs` routing: a client has preferred-first addresses (LAN, then remote); `connect()` probes `/server/ping`, failed requests reroute once, `watch_routes` returns to the LAN address. Cache keys use `identity()` (the first address), not `base()`. Away from home the LAN IP doesn't answer, so the remote address is used
 - UI layers draw `base`, then `overlay` (viewer), then `popup` (menus, sheets, toasts)
 
 ## Working on it

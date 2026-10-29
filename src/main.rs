@@ -1,3 +1,4 @@
+mod account;
 mod actions;
 mod gestures;
 mod grid;
@@ -7,6 +8,7 @@ mod immich;
 mod library;
 mod live;
 mod loader;
+mod login;
 mod map;
 mod render;
 mod search;
@@ -91,6 +93,16 @@ struct Core {
     // height (logical px) its filter chips take.
     search: search::Search,
     header_extra: f32,
+    /// The sign-in screen, shown instead of everything while signed out.
+    login: Option<login::Login>,
+    /// Asked for by the sign-in screen or Settings; the window rebuilds the app on it.
+    switch: Option<Switch>,
+}
+
+/// Swapping the whole app for another account (or none).
+pub enum Switch {
+    SignIn(immich::Immich),
+    SignOut,
 }
 
 fn viewport(size: (u32, u32), scale: f32, left: f32, extra: f32) -> Viewport {
@@ -102,7 +114,15 @@ impl Core {
         let sidebar = sidebar::Sidebar::new(&loader);
         let viewer = viewer::Viewer::new(&loader);
         let live = match loader.source() {
-            Source::Immich(immich) => Some(live::start(immich.clone(), &loader.handle(), loader.waker())),
+            Source::Immich(immich) => {
+                // Pick the best address now, and come back to the local one when it returns.
+                let i = immich.clone();
+                loader.handle().spawn(async move {
+                    let _ = i.connect().await;
+                    i.watch_routes().await;
+                });
+                Some(live::start(immich.clone(), &loader.handle(), loader.waker()))
+            }
             Source::Demo(_) => None,
         };
         // The renderer was built for a memory budget already; don't rebuild its atlases.
@@ -138,8 +158,36 @@ impl Core {
             actions,
             search: search::Search::new(),
             header_extra: 0.0,
+            login: None,
+            switch: None,
         };
         settings::apply(&mut core);
+        core
+    }
+
+    /// Shows the sign-in screen (the core runs on an empty source meanwhile).
+    fn sign_in_screen(&mut self) {
+        self.login = Some(login::Login::new(self.loader.handle(), self.loader.waker()));
+    }
+
+    /// Rebuilds the app for `switch`, keeping the GPU renderer and window size.
+    fn rebuild(self, switch: Switch, wake: impl Fn() + Send + Sync + 'static) -> Core {
+        let (size, scale) = (self.size, self.scale);
+        let Core { renderer, .. } = self;
+        let source = match switch {
+            Switch::SignIn(immich) => Source::Immich(immich.fresh().unwrap_or(immich)),
+            Switch::SignOut => {
+                if let Err(e) = account::sign_out() {
+                    log::warn!("signing out: {e:#}");
+                }
+                Source::Demo(0)
+            }
+        };
+        let signed_out = matches!(source, Source::Demo(0));
+        let mut core = Core::new(Loader::start(source, wake), renderer, size, scale);
+        if signed_out {
+            core.sign_in_screen();
+        }
         core
     }
 
@@ -217,6 +265,9 @@ impl Core {
         self.frame += 1;
         let frame = self.frame;
         self.ui.clear();
+        if self.login.is_some() {
+            return login::update(self, now);
+        }
         let sidebar_moving = sidebar::update(self, now);
         let sidebar_moving = search::update(self, now) || sidebar_moving;
         // Settings › Playback: hover previews and their sound.
@@ -489,6 +540,8 @@ struct Gpu {
 
 struct App {
     source: Source,
+    /// No key saved: start on the sign-in screen.
+    signed_out: bool,
     proxy: EventLoopProxy<()>,
     core: Option<Core>,
     gpu: Option<Gpu>,
@@ -545,7 +598,11 @@ impl ApplicationHandler for App {
                 self.pinch = Some(rx);
             }
         }
-        self.core = Some(Core::new(loader, renderer, (config.width, config.height), window.scale_factor() as f32));
+        let mut core = Core::new(loader, renderer, (config.width, config.height), window.scale_factor() as f32);
+        if self.signed_out {
+            core.sign_in_screen();
+        }
+        self.core = Some(core);
         self.gpu = Some(Gpu { surface, config, instance });
         window.request_redraw();
         self.window = Some(window);
@@ -590,12 +647,66 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        self.handle(event_loop, id, event);
+        // Signing in or out: a fresh app for the new account, on the same window and GPU.
+        if let Some(core) = self.core.take_if(|c| c.switch.is_some()) {
+            let mut core = core;
+            let switch = core.switch.take().unwrap();
+            let proxy = self.proxy.clone();
+            let core = core.rebuild(switch, move || {
+                let _ = proxy.send_event(());
+            });
+            self.source = core.loader.source().clone();
+            self.core = Some(core);
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
+}
+
+impl App {
+    fn handle(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let (Some(core), Some(gpu), Some(window)) = (&mut self.core, &mut self.gpu, &self.window) else { return };
         let now = Instant::now();
         let scale = window.scale_factor() as f32;
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            self.cursor = (position.x as f32, position.y as f32);
+        }
+        // Signed out: the sign-in screen takes all input.
+        if let Some(login) = &mut core.login
+            && login.event(&event, self.cursor, self.modifiers)
+        {
+            window.request_redraw();
+            return;
+        }
+        if core.login.is_some() {
+            match &event {
+                WindowEvent::KeyboardInput { event: k, .. }
+                    if k.state == ElementState::Pressed && self.modifiers.control_key() && k.logical_key == Key::Character("q".into()) =>
+                {
+                    return event_loop.exit();
+                }
+                WindowEvent::RedrawRequested
+                | WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::CloseRequested
+                | WindowEvent::CursorMoved { .. } => {}
+                _ => return,
+            }
+        }
         // The search field takes the keyboard while focused, then popovers, selection clicks and
         // action shortcuts come before everything else.
+        // An address field in Settings takes typing before any shortcut.
+        if let Some(page) = core.settings_page.as_mut().filter(|p| p.editing())
+            && matches!(event, WindowEvent::KeyboardInput { .. })
+            && matches!(page.event(&event, self.cursor, false, self.modifiers, scale), settings_ui::Response::Handled)
+        {
+            window.request_redraw();
+            return;
+        }
         if search::input(core, &event, self.modifiers) || actions::input(core, &event, self.modifiers) {
             window.request_redraw();
             return;
@@ -833,18 +944,34 @@ struct Shot {
     search: Option<search::Shot>,
 }
 
-fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
+fn screenshot(source: Source, login: Option<login::Shot>, path: &str, size: (u32, u32), scale: f32, shot: Shot) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let (adapter, device, queue) = pollster::block_on(gpu_device(&instance, None))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let renderer = Renderer::new(device, queue, format, adapter.get_info(), shot.settings.gpu_memory);
+    let prepare = |core: &mut Core| {
+        core.settings = shot.settings.clone();
+        settings::apply(core);
+        core.sidebar.set_shown(shot.sidebar);
+        // Videos only play when asked (--play-at), and never out loud.
+        (core.viewer.autoplay, core.viewer.silent) = (false, true);
+        (core.hover.silent, core.hover.instant) = (true, true);
+    };
     let mut core = Core::new(Loader::start(source, || {}), renderer, size, scale);
-    core.settings = shot.settings.clone();
-    settings::apply(&mut core);
-    core.sidebar.set_shown(shot.sidebar);
-    // Videos only play when asked (--play-at), and never out loud.
-    (core.viewer.autoplay, core.viewer.silent) = (false, true);
-    (core.hover.silent, core.hover.instant) = (true, true);
+    prepare(&mut core);
+    // Signed out: the sign-in screen, optionally with a key pasted. Signing in carries on
+    // with the rest of the shot on the real library.
+    if let Some(l) = login {
+        core.sign_in_screen();
+        login::drive(&mut core, &l)?;
+        match core.switch.take() {
+            Some(switch) => {
+                core = core.rebuild(switch, || {});
+                prepare(&mut core);
+            }
+            None => return write_png(&mut core, size, format, path),
+        }
+    }
 
     let settle = |core: &mut Core| -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -1053,6 +1180,14 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
         println!("theme generation {generation} -> {}", theme::generation());
         settle(&mut core)?;
     }
+    write_png(&mut core, size, format, path)?;
+    if let Some(a) = &shot.actions {
+        actions::after(&mut core, a, &settle)?;
+    }
+    Ok(())
+}
+
+fn write_png(core: &mut Core, size: (u32, u32), format: wgpu::TextureFormat, path: &str) -> Result<()> {
     let device = &core.renderer.device;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -1094,32 +1229,23 @@ fn screenshot(source: Source, path: &str, size: (u32, u32), scale: f32, shot: Sh
     }
     img.save(path)?;
     println!("wrote {path}");
-    if let Some(a) = &shot.actions {
-        actions::after(&mut core, a, &settle)?;
-    }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
 
-fn source_from(args: &[String]) -> Result<Source> {
+/// The library to show, or `Demo(0)` and true when nobody is signed in (or `--login` asks
+/// for the sign-in screen).
+fn source_from(args: &[String]) -> Result<(Source, bool)> {
     if let Some(i) = args.iter().position(|a| a == "--demo") {
         let n = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(40_000);
-        return Ok(Source::Demo(n));
+        return Ok((Source::Demo(n), false));
     }
-    let file = dirs::config_dir().map(|d| d.join("lumen/config.json"));
-    let cfg: Option<serde_json::Value> =
-        file.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok());
-    let get = |env: &str, key: &str| {
-        std::env::var(env).ok().or_else(|| cfg.as_ref()?.get(key)?.as_str().map(String::from))
-    };
-    let (Some(url), Some(key)) = (get("IMMICH_URL", "url"), get("IMMICH_API_KEY", "api_key")) else {
-        bail!(
-            "no Immich server configured.\n\nSet IMMICH_URL and IMMICH_API_KEY, or write {}\n  {{ \"url\": \"https://photos.example.com\", \"api_key\": \"…\" }}\n\nOr try it without a server:  lumen --demo 40000",
-            file.map_or("~/.config/lumen/config.json".into(), |f| f.display().to_string())
-        );
-    };
-    Ok(Source::Immich(immich::Immich::new(&url, &key)?))
+    let config = account::Config::load();
+    if !config.signed_in() || args.iter().any(|a| a == "--login") {
+        return Ok((Source::Demo(0), true));
+    }
+    Ok((Source::Immich(config.client()?), false))
 }
 
 /// Saved settings plus any `--set key=value` overrides (headless only; not saved unless
@@ -1140,7 +1266,7 @@ fn settings_from(args: &[String]) -> Result<settings::Settings> {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("lumen=info,wgpu=error")).init();
     let args: Vec<String> = std::env::args().collect();
-    let source = source_from(&args)?;
+    let (source, signed_out) = source_from(&args)?;
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
 
     if let Some(path) = flag("--screenshot") {
@@ -1177,12 +1303,14 @@ fn main() -> Result<()> {
             theme_wait: flag("--theme-wait").and_then(|s| s.parse().ok()),
             search: search::Shot::parse(&args),
         };
-        return screenshot(source, &path, size, scale, shot);
+        let login = signed_out.then(|| login::Shot::parse(&args));
+        return screenshot(source, login, &path, size, scale, shot);
     }
 
     let event_loop = EventLoop::<()>::with_user_event().build().context("event loop")?;
     let mut app = App {
         source,
+        signed_out,
         proxy: event_loop.create_proxy(),
         core: None,
         gpu: None,
