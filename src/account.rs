@@ -119,7 +119,7 @@ pub async fn verify(config: &Config) -> Result<(Immich, Me), String> {
 }
 
 /// Forgets the key (the addresses stay, so signing in again only needs a key) and the cached
-/// timelines, which belong to this account. Thumbnails stay: they're only reachable by id.
+/// timelines, albums and people, which belong to this account. Thumbnails stay: they're only reachable by id.
 pub fn sign_out() -> Result<()> {
     // Headless runs leave the real account alone.
     if crate::settings::READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
@@ -131,7 +131,7 @@ pub fn sign_out() -> Result<()> {
     if let Ok(dir) = std::fs::read_dir(crate::loader::cache_dir()) {
         for e in dir.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("library-") && name.ends_with(".json") {
+            if ["library-", "albums-", "people-"].iter().any(|p| name.starts_with(p)) && name.ends_with(".json") {
                 let _ = std::fs::remove_file(e.path());
             }
         }

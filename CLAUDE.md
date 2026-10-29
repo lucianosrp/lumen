@@ -7,7 +7,7 @@ glyphon (text), GStreamer (video). Config: `~/.config/lumen/config.json` (`url`,
 - `main.rs`: `Core` (app state, per-frame `update`, header), `App` (winit window and input), headless `screenshot()` and CLI flags
 - `grid.rs` (+ `grid.wgsl`, `render.rs`): timeline grid, a single instanced draw. Zoom levels, blend animations, continuous pinch (`Spec::Scaled`)
 - `render.rs`: thumbnail atlases by tier (small 64 / large 256 / xl 1024 px) plus a mipmapped thumbhash atlas
-- `loader.rs`: library sync by collection (`Collection`, `Loader::open`), thumbnail workers fed by a priority want-list, disk caches in `~/.cache/lumen/`
+- `loader.rs`: library sync by collection (`Collection`, `Loader::open`), thumbnail workers fed by a priority want-list, disk caches in `~/.cache/lumen/`. Sync is incremental: a `*.index.json` next to each timeline cache records month → (count, ids); opening fetches only months whose counts changed plus the newest, quietly when a cache exists. Live events (`Loader::refresh`) and caches older than a day fetch every month. Sidebar albums/people are cached as `albums-*.json` / `people-*.json`, faces in `people/`
 - `ui.rs` / `ui_render.rs` / `ui.wgsl`: immediate-mode draw list (`Frame { base, overlay }` of quads, images and text)
 - `sidebar.rs`, `viewer.rs`, `video.rs` (GStreamer), `map.rs` (Places), `gestures.rs` (Wayland pinch; remove once on winit 0.31)
 - `actions.rs`: selection, favorite, archive, trash/restore, add-to-album, context menus, toasts with undo. Optimistic edits go through `Library::edit` and `Renderer::remap_library`

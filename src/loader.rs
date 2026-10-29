@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use image::imageops::FilterType;
 
 use crate::immich::Immich;
@@ -207,19 +208,26 @@ impl Loader {
             return;
         }
         self.shared.fresh.lock().unwrap().clear();
-        self.open(collection);
+        // Something changed, maybe in an old month without changing its count (a favorite
+        // set elsewhere): check every month, quietly.
+        self.begin(collection, true);
     }
 
     /// Switches the grid to `collection`: cached version first, then a refresh. Supersedes
     /// any sync still running for an earlier `open`.
     pub fn open(&self, collection: Collection) {
+        self.begin(collection, false);
+    }
+
+    /// `full`: fetch every month rather than only those whose counts changed.
+    fn begin(&self, collection: Collection, full: bool) {
         let request = {
             let mut q = self.shared.queue.lock().unwrap();
             q.request += 1;
             q.syncing = true;
             q.request
         };
-        let task = self.rt.spawn(sync(self.source.clone(), self.shared.clone(), Arc::new(collection), request));
+        let task = self.rt.spawn(sync(self.source.clone(), self.shared.clone(), Arc::new(collection), request, full));
         if let Some(old) = self.sync.lock().unwrap().replace(task.abort_handle()) {
             old.abort();
         }
@@ -376,7 +384,7 @@ async fn publish(shared: &Arc<Shared>, collection: &Arc<Collection>, request: u6
     shared.send(Msg::Library { library, generation, collection: collection.clone() });
 }
 
-async fn sync(source: Source, shared: Arc<Shared>, collection: Arc<Collection>, request: u64) {
+async fn sync(source: Source, shared: Arc<Shared>, collection: Arc<Collection>, request: u64, full: bool) {
     let query = collection.query.clone();
     if let Some(assets) = collection.fixed.clone() {
         publish(&shared, &collection, request, assets).await;
@@ -401,7 +409,7 @@ async fn sync(source: Source, shared: Arc<Shared>, collection: Arc<Collection>, 
                 shared.fresh.lock().unwrap().insert(query, (Instant::now(), assets.clone()));
                 publish(&shared, &collection, request, assets).await;
             }
-            Source::Immich(immich) => ok = sync_immich(immich, &shared, &collection, request).await,
+            Source::Immich(immich) => ok = sync_immich(immich, &shared, &collection, request, full).await,
         }
     }
     let mut q = shared.queue.lock().unwrap();
@@ -414,13 +422,37 @@ async fn sync(source: Source, shared: Arc<Shared>, collection: Arc<Collection>, 
     }
 }
 
+/// Which assets each month of a cached timeline held, so a later sync only fetches the
+/// months whose counts changed. Kept next to the timeline's cache file.
+#[derive(Serialize, Deserialize, Default)]
+struct Index {
+    /// Unix seconds of the last sync that fetched every month.
+    full_at: u64,
+    /// Month → (count the server reported, asset ids).
+    buckets: HashMap<String, (usize, Vec<String>)>,
+}
+
+/// Every month is fetched again at least this often, catching edits that kept counts the same.
+const FULL_EVERY: Duration = Duration::from_secs(24 * 3600);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// Returns false if the refresh failed (the error stays in the status line).
-async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Collection>, request: u64) -> bool {
-    // Show the last known version instantly, then refresh from the server.
+///
+/// The cached timeline shows at once. Then the server's month counts (one request) say which
+/// months changed; only those, plus the newest, are fetched again. With a cache this all
+/// happens without a word in the status line.
+async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Collection>, request: u64, full: bool) -> bool {
     let query = &collection.query;
     let path = library_cache_path(immich, query);
+    let index_path = path.with_extension("index.json");
     let cached: Option<Arc<Vec<Asset>>> =
         std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(Arc::new);
+    let index: Option<Index> = cached
+        .as_ref()
+        .and_then(|_| serde_json::from_slice(&std::fs::read(&index_path).ok()?).ok());
     if let Some(assets) = cached.clone() {
         publish(shared, collection, request, assets).await;
     } else if query == LIBRARY_QUERY {
@@ -428,17 +460,70 @@ async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Col
     } else {
         shared.status(request, format!("Loading {}…", collection.title));
     }
+    let quiet = cached.is_some();
     let s = shared.clone();
     let progress = move |done: usize, total: usize| {
-        s.status(request, format!("Syncing {} of {} photos…", group(done), group(total)))
+        if !quiet {
+            s.status(request, format!("Syncing {} of {} photos…", group(done), group(total)))
+        }
     };
-    match immich.timeline(query, progress).await {
-        Ok(mut assets) => {
+
+    let result = async {
+        let server = immich.buckets(query).await?;
+        let stale = full || index.as_ref().is_none_or(|i| unix_now().saturating_sub(i.full_at) > FULL_EVERY.as_secs());
+        let (Some(cached), Some(old), false) = (cached.as_ref(), index.as_ref(), stale) else {
+            // Everything, from scratch.
+            let months = immich.bucket_assets(query, &server, progress).await?;
+            let mut idx = Index { full_at: unix_now(), buckets: HashMap::new() };
+            let mut assets = Vec::new();
+            for (name, list) in months {
+                let count = server.iter().find(|b| b.0 == name).map_or(list.len(), |b| b.1);
+                idx.buckets.insert(name, (count, list.iter().map(|a| a.id.clone()).collect()));
+                assets.extend(list);
+            }
+            return anyhow::Ok((assets, idx));
+        };
+        // Months that are new or changed size, and always the newest (recent edits).
+        let newest = server.first().map(|b| b.0.clone());
+        let changed: Vec<(String, usize)> = server
+            .iter()
+            .filter(|(name, count)| old.buckets.get(name).is_none_or(|o| o.0 != *count) || Some(name) == newest.as_ref())
+            .cloned()
+            .collect();
+        let gone: Vec<&String> = old.buckets.keys().filter(|k| !server.iter().any(|b| &b.0 == *k)).collect();
+        let mut drop: HashSet<&str> = HashSet::new();
+        for name in changed.iter().map(|b| &b.0).chain(gone.iter().copied()) {
+            if let Some((_, ids)) = old.buckets.get(name) {
+                drop.extend(ids.iter().map(String::as_str));
+            }
+        }
+        log::info!("sync {}: {} of {} months changed", collection.key, changed.len(), server.len());
+        let months = immich.bucket_assets(query, &changed, progress).await?;
+        let mut idx = Index { full_at: old.full_at, buckets: old.buckets.clone() };
+        for name in &gone {
+            idx.buckets.remove(*name);
+        }
+        let mut assets: Vec<Asset> = cached.iter().filter(|a| !drop.contains(a.id.as_str())).cloned().collect();
+        for (name, list) in months {
+            let count = changed.iter().find(|b| b.0 == name).map_or(list.len(), |b| b.1);
+            idx.buckets.insert(name, (count, list.iter().map(|a| a.id.clone()).collect()));
+            assets.extend(list);
+        }
+        Ok((assets, idx))
+    }
+    .await;
+
+    match result {
+        Ok((mut assets, idx)) => {
             assets.sort_by(|a, b| a.taken.cmp(&b.taken));
+            // An asset listed in two months (a date edited mid-sync) shows once.
+            let mut seen = HashSet::new();
+            assets.retain(|a| seen.insert(a.id.clone()));
             let assets = Arc::new(assets);
             shared.fresh.lock().unwrap().insert(query.clone(), (Instant::now(), assets.clone()));
+            let _ = std::fs::create_dir_all(cache_dir());
+            let _ = std::fs::write(&index_path, serde_json::to_vec(&idx).unwrap());
             if cached.as_ref().is_none_or(|c| *c != assets) {
-                let _ = std::fs::create_dir_all(cache_dir());
                 let _ = std::fs::write(&path, serde_json::to_vec(&*assets).unwrap());
                 publish(shared, collection, request, assets).await;
             }
@@ -446,10 +531,19 @@ async fn sync_immich(immich: &Immich, shared: &Arc<Shared>, collection: &Arc<Col
         }
         Err(e) => {
             log::error!("sync {} failed: {e:#}", collection.key);
-            shared.status(request, format!("Sync failed: {e:#}"));
-            false
+            // With a cache on screen, a failed check isn't worth a red line.
+            if !quiet {
+                shared.status(request, format!("Sync failed: {e:#}"));
+                return false;
+            }
+            true
         }
     }
+}
+
+/// A per-server cache file, e.g. `server_cache_path(immich, "albums")` → `albums-<server>.json`.
+pub fn server_cache_path(immich: &Immich, stem: &str) -> PathBuf {
+    cache_dir().join(format!("{stem}-{:016x}.json", fxhash(&immich.identity())))
 }
 
 fn library_cache_path(immich: &Immich, query: &str) -> PathBuf {

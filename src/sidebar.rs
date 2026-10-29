@@ -1,7 +1,8 @@
 //! The left sidebar, like Apple Photos': library sections, utilities, albums and people.
 //!
-//! Albums and people are fetched once in the background; their thumbnails arrive one by one
-//! over our own channel and become UI images on the next frame.
+//! Albums and people show from a disk cache at once and are refreshed in the background;
+//! their thumbnails (cached on disk too) arrive one by one over our own channel and become UI
+//! images on the next frame.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,12 +12,12 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use futures::{StreamExt, stream};
 use image::imageops::FilterType;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use winit::event::MouseScrollDelta;
 
 use crate::Core;
 use crate::immich::Immich;
-use crate::loader::{Collection, Loader, Source, group, thumbnail_bytes};
+use crate::loader::{Collection, Loader, Source, cache_dir, group, server_cache_path, thumbnail_bytes};
 use crate::ui::{Align, Font, ImageId, Quad, Text, rgb, theme};
 
 /// Logical pixels.
@@ -42,7 +43,7 @@ pub enum Action {
     Settings,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct Album {
     id: String,
@@ -53,13 +54,16 @@ struct Album {
     updated_at: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct Person {
     id: String,
     name: String,
     #[serde(default)]
     is_hidden: bool,
+    /// Changes when the face photo does; names its cached thumbnail.
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -542,22 +546,46 @@ fn ease(t: f32) -> f32 {
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// The last list saved for this server, if any.
+fn read_cached<T: DeserializeOwned>(immich: &Immich, stem: &str) -> Option<Vec<T>> {
+    serde_json::from_slice(&std::fs::read(server_cache_path(immich, stem)).ok()?).ok()
+}
+
+fn write_cached<T: Serialize>(immich: &Immich, stem: &str, items: &[T]) {
+    let _ = std::fs::create_dir_all(cache_dir());
+    let _ = std::fs::write(server_cache_path(immich, stem), serde_json::to_vec(items).unwrap());
+}
+
+fn album_thumbs(albums: &[Album]) -> Vec<(String, String)> {
+    albums.iter().filter_map(|a| Some((format!("album:{}", a.id), a.album_thumbnail_asset_id.clone()?))).collect()
+}
+
+/// Albums: the cached list first, then the server's if it differs.
 async fn fetch_albums(immich: Immich, tx: Sender<Fetched>, wake: Wake) {
+    let thumb = |id: String| {
+        let immich = immich.clone();
+        async move { thumbnail_bytes(&immich, &id).await }
+    };
+    let cached: Option<Vec<Album>> = read_cached(&immich, "albums");
+    if let Some(albums) = cached.clone() {
+        let thumbs = album_thumbs(&albums);
+        let _ = tx.send(Fetched::Albums(albums));
+        wake();
+        load_thumbs(&tx, &wake, thumbs, thumb).await;
+    }
     match immich.get_json::<Vec<Album>>("/albums").await {
         Ok(mut albums) => {
             let recent = |a: &Album| a.end_date.clone().or_else(|| a.updated_at.clone()).unwrap_or_default();
             albums.sort_by_key(|a| std::cmp::Reverse(recent(a)));
-            let thumbs: Vec<(String, String)> = albums
-                .iter()
-                .filter_map(|a| Some((format!("album:{}", a.id), a.album_thumbnail_asset_id.clone()?)))
-                .collect();
-            let _ = tx.send(Fetched::Albums(albums));
-            wake();
-            load_thumbs(&tx, &wake, thumbs, |id| {
-                let immich = immich.clone();
-                async move { thumbnail_bytes(&immich, &id).await }
-            })
-            .await;
+            if cached.as_ref() != Some(&albums) {
+                write_cached(&immich, "albums", &albums);
+                // Only covers that changed need loading again.
+                let old: Vec<(String, String)> = cached.as_deref().map(album_thumbs).unwrap_or_default();
+                let thumbs: Vec<(String, String)> = album_thumbs(&albums).into_iter().filter(|t| !old.contains(t)).collect();
+                let _ = tx.send(Fetched::Albums(albums));
+                wake();
+                load_thumbs(&tx, &wake, thumbs, thumb).await;
+            }
         }
         Err(e) => log::warn!("albums: {e:#}"),
     }
@@ -565,18 +593,48 @@ async fn fetch_albums(immich: Immich, tx: Sender<Fetched>, wake: Wake) {
     wake();
 }
 
+fn person_thumbs(people: &[Person]) -> Vec<(String, String)> {
+    people.iter().map(|p| (format!("person:{}", p.id), format!("{}|{}", p.id, p.updated_at.as_deref().unwrap_or("")))).collect()
+}
+
+/// A face thumbnail, from the disk cache when this version of it was fetched before.
+async fn face_bytes(immich: &Immich, key: &str) -> Result<Vec<u8>> {
+    let (id, version) = key.split_once('|').unwrap_or((key, ""));
+    let name = format!("{id}-{:x}", version.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)));
+    let path = cache_dir().join("people").join(name);
+    if let Ok(b) = tokio::fs::read(&path).await {
+        return Ok(b);
+    }
+    let b = immich.get_bytes(&format!("/people/{id}/thumbnail")).await?;
+    let _ = tokio::fs::create_dir_all(path.parent().unwrap()).await;
+    let _ = tokio::fs::write(&path, &b).await;
+    Ok(b)
+}
+
+/// People: the cached list first, then the server's if it differs.
 async fn fetch_people(immich: Immich, tx: Sender<Fetched>, wake: Wake) {
+    let thumb = |key: String| {
+        let immich = immich.clone();
+        async move { face_bytes(&immich, &key).await }
+    };
+    let cached: Option<Vec<Person>> = read_cached(&immich, "people");
+    if let Some(people) = cached.clone() {
+        let thumbs = person_thumbs(&people);
+        let _ = tx.send(Fetched::People(people));
+        wake();
+        load_thumbs(&tx, &wake, thumbs, thumb).await;
+    }
     match immich.get_json::<People>("/people?withHidden=false&size=500").await {
         Ok(People { people }) => {
             let people: Vec<Person> = people.into_iter().filter(|p| !p.is_hidden && !p.name.trim().is_empty()).collect();
-            let thumbs = people.iter().map(|p| (format!("person:{}", p.id), p.id.clone())).collect();
-            let _ = tx.send(Fetched::People(people));
-            wake();
-            load_thumbs(&tx, &wake, thumbs, |id| {
-                let immich = immich.clone();
-                async move { immich.get_bytes(&format!("/people/{id}/thumbnail")).await }
-            })
-            .await;
+            if cached.as_ref() != Some(&people) {
+                write_cached(&immich, "people", &people);
+                let old = cached.as_deref().map(person_thumbs).unwrap_or_default();
+                let thumbs: Vec<(String, String)> = person_thumbs(&people).into_iter().filter(|t| !old.contains(t)).collect();
+                let _ = tx.send(Fetched::People(people));
+                wake();
+                load_thumbs(&tx, &wake, thumbs, thumb).await;
+            }
         }
         Err(e) => log::warn!("people: {e:#}"),
     }

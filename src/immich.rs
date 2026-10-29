@@ -183,23 +183,35 @@ impl Immich {
         Ok(res)
     }
 
-    /// Fetches a timeline's metadata, e.g. `query` = "visibility=timeline" or "albumId=…".
-    /// `progress` gets (assets so far, total).
-    pub async fn timeline(&self, query: &str, progress: impl Fn(usize, usize)) -> Result<Vec<Asset>> {
+    /// A timeline's months and how many assets each holds, newest first, e.g. `query` =
+    /// "visibility=timeline" or "albumId=…".
+    pub async fn buckets(&self, query: &str) -> Result<Vec<(String, usize)>> {
         let buckets: Vec<Bucket> = self.get(&format!("/timeline/buckets?{query}")).await?.json().await?;
-        let total = buckets.iter().map(|b| b.count).sum();
+        Ok(buckets.into_iter().map(|b| (b.time_bucket, b.count)).collect())
+    }
+
+    /// The assets of the given months, eight at a time. `progress` gets (assets so far, total).
+    pub async fn bucket_assets(
+        &self,
+        query: &str,
+        buckets: &[(String, usize)],
+        progress: impl Fn(usize, usize),
+    ) -> Result<Vec<(String, Vec<Asset>)>> {
+        let total = buckets.iter().map(|b| b.1).sum();
         let mut done = 0;
-        let mut assets = Vec::with_capacity(total);
-        let mut results = stream::iter(buckets)
-            .map(|b| async move {
-                let path = format!("/timeline/bucket?{query}&timeBucket={}", b.time_bucket);
+        let mut out = Vec::with_capacity(buckets.len());
+        let names: Vec<String> = buckets.iter().map(|b| b.0.clone()).collect();
+        let mut results = stream::iter(names)
+            .map(|name| async move {
+                let path = format!("/timeline/bucket?{query}&timeBucket={name}");
                 let cols: BucketAssets = self.get(&path).await?.json().await?;
-                anyhow::Ok(cols)
+                anyhow::Ok((name, cols))
             })
             .buffer_unordered(8);
-        while let Some(cols) = results.next().await {
-            let cols = cols?;
+        while let Some(r) = results.next().await {
+            let (name, cols) = r?;
             done += cols.id.len();
+            let mut assets = Vec::with_capacity(cols.id.len());
             for (i, id) in cols.id.into_iter().enumerate() {
                 assets.push(Asset {
                     id,
@@ -212,9 +224,10 @@ impl Immich {
                     favorite: cols.is_favorite.get(i).copied().unwrap_or(false),
                 });
             }
+            out.push((name, assets));
             progress(done, total);
         }
-        Ok(assets)
+        Ok(out)
     }
 
     /// Sends a JSON body to `/api{path}` with auth; errors on non-2xx with the server's message.
