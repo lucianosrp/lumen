@@ -2,6 +2,12 @@
 name = "lumen"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, native desktop photo viewer for Immich"
+license = "MIT"
+repository = "https://github.com/lucianosrp/lumen"
+readme = "README.md"
+keywords = ["immich", "photos", "gallery", "wgpu"]
+categories = ["multimedia::images"]
 
 [dependencies]
 anyhow = "1.0.104"
