@@ -213,10 +213,6 @@ impl UiRenderer {
         self.images.remove(&id);
     }
 
-    pub fn image_size(&self, id: ImageId) -> Option<(u32, u32)> {
-        self.images.get(&id).map(|i| i.size)
-    }
-
     /// Width in pixels of a single line of text, for layout.
     pub fn measure(&mut self, text: &str, size: f32, weight: u16, font: Font) -> f32 {
         let key = TextKey { text: text.to_string(), size: size.to_bits(), weight, font, max_width: None };

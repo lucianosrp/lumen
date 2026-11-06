@@ -108,11 +108,6 @@ impl Layer {
         self.quads.push(q);
     }
 
-    /// A vector icon centred on `center`, `size` physical px square, tinted `color`.
-    pub fn icon(&mut self, name: &'static str, center: [f32; 2], size: f32, color: [f32; 4]) {
-        self.icon_styled(name, center, size, color, crate::icons::IconStyle::default());
-    }
-
     pub fn icon_styled(&mut self, name: &'static str, center: [f32; 2], size: f32, color: [f32; 4], style: crate::icons::IconStyle) {
         debug_assert!(crate::icons::exists(name), "unknown icon {name}");
         // Whole pixels: the raster is made at exactly this size, so it lands pixel-aligned.

@@ -23,7 +23,6 @@ pub struct Config {
 #[derive(Deserialize)]
 pub struct Me {
     pub name: String,
-    pub email: String,
 }
 
 pub fn path() -> PathBuf {

@@ -258,11 +258,6 @@ impl Loader {
         self.rt.handle().clone()
     }
 
-    /// Call from background work after sending a result, so the UI redraws.
-    pub fn wake(&self) {
-        (self.shared.wake)();
-    }
-
     /// A clonable, Send waker for moving into spawned tasks.
     pub fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
         let shared = self.shared.clone();
